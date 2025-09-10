@@ -22,18 +22,49 @@ from pyht import Client, TTSOptions, Format
 from dotenv import load_dotenv
 import logging
 import live
+from elevenlabs.client import ElevenLabs
+try:
+    from elevenlabs import play as el_play  # In some SDK versions this is a function; in others it's a module
+except Exception:
+    el_play = None
+
+try:
+    # ElevenLabs SDK helper to play streamed audio locally
+    from elevenlabs import stream as el_stream
+except Exception:
+    el_stream = None
+
+try:
+    # Typed settings helper (optional but aligns with current SDK)
+    from elevenlabs import VoiceSettings as EL_VoiceSettings
+except Exception:
+    EL_VoiceSettings = None
+from io import BytesIO
 from typing import AsyncGenerator, AsyncIterable, Generator, Iterable, Union, Optional
 import struct, binascii   # add at top of the file if not already there
 #
 # Ensure .env values override any stale shell envs
 load_dotenv(override=True)
 
+# Ensure runtime directories exist
+def ensure_directories():
+    for d in ["RecordedAudio", "RecordedAudio/New", "RecordedAudio/Old"]:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            logging.warning(f"Could not ensure directory {d}: {e}")
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # Constants
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_PROJECT = os.getenv('OPENAI_PROJECT')
+
+elevenlabs = ElevenLabs(
+  api_key=os.getenv("ELEVENLABS_API_KEY"),
+)
 
 # Instantiate client explicitly with project to avoid defaulting to a project with no credit
 client = OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT) if OPENAI_PROJECT else OpenAI(api_key=OPENAI_API_KEY)
@@ -45,13 +76,31 @@ def debug_print_openai_creds():
     print(f"OPENAI_API_KEY set: {'yes' if key else 'no'} (prefix: {key[:7]+'…' if key else '—'})")
     print(f"OPENAI_PROJECT set: {'yes' if proj else 'no'} (value: {proj if proj else '—'})")
 
+# Sanity-check helper to print which OpenAI credentials are in use
 debug_print_openai_creds()
+
+# Cross-platform temp-file playback fallback for ElevenLabs streaming
+def _play_file_best_effort(tmp_path: str, codec_hint: str = "mp3"):
+    """
+    Best-effort synchronous playback of a small temporary audio file.
+    On macOS uses 'afplay'; on other platforms we just log where the file is.
+    """
+    try:
+        import subprocess, sys
+        if sys.platform == 'darwin':
+            subprocess.run(['afplay', tmp_path], check=True)
+        else:
+            logging.error(f"No portable playback fallback for platform {sys.platform}. File saved at {tmp_path}")
+    except Exception as e:
+        logging.error(f"Fallback playback failed ({codec_hint}) at {tmp_path}: {e}")
 #PLAYHT_API_KEYS = [os.getenv('PLAYHT_API_KEY'), os.getenv('PLAYHT_API_KEY_SPARE')]
 #PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID'), os.getenv('PLAYHT_USER_ID_SPARE')]
 
 PLAYHT_API_KEYS = [os.getenv('PLAYHT_API_KEY')]
 PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID')] 
 
+# Engine selector (scaffolding for runtime swap)
+TTS_ENGINE = (os.getenv('TTS_ENGINE') or 'playht').strip().lower()
 
 VOICE_CLONE_MODEL = "PlayHT2.0-turbo"      # 48 kHz / 16‑bit mono
 LLM_MODEL = "gpt-4o-mini-2024-07-18"
@@ -64,7 +113,6 @@ CHANNELS = 1
 RATE = 48000
 CHUNK = 2048
 
-
 url = "https://api.play.ht/api/v2/cloned-voices/instant"
 
 OldSound = "RecordedAudio/Old"
@@ -73,6 +121,12 @@ New = "RecordedAudio/New"
 SoundTrack = "/Users/x/myenv/bin/tester.wav"
 
 arduinoLocation = '/dev/cu.usbmodem8301'
+
+# Ensure runtime directories exist at startup
+ensure_directories()
+
+# Log configured TTS engine
+logging.info(f"Configured TTS_ENGINE={TTS_ENGINE}")
 
 class APIKeyManager:
     def __init__(self, keys, user_ids):
@@ -115,29 +169,33 @@ class SessionAudioManager:
         return self.total_duration >= 7.5
 
     def concatenate_clips(self):
-        """Concatenate all clips into a single file and return the path."""
-        
+        """Concatenate all clips into a single WAV and return the path, or None if no clips."""
+        if not self.clips:
+            logging.info("concatenate_clips: no clips to concatenate")
+            return None
+
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         output_path = f"RecordedAudio/concatenated_audio_{timestamp}.wav"
-        
-        # Open the output file
-        with wave.open(output_path, 'wb') as wf:
-            # Initialize parameters from the first clip to standardize all clips
-            with wave.open(self.clips[0], 'rb') as cf:
-                wf.setnchannels(cf.getnchannels())
-                wf.setsampwidth(cf.getsampwidth())
-                wf.setframerate(cf.getframerate())
 
-            # Concatenate each clip
-            for clip in self.clips:
-                with wave.open(clip, 'rb') as cf:
-                    frames = cf.readframes(cf.getnframes())
-                    wf.writeframes(frames)
+        try:
+            with wave.open(output_path, 'wb') as wf:
+                # Initialize parameters from the first clip
+                with wave.open(self.clips[0], 'rb') as cf:
+                    wf.setnchannels(cf.getnchannels())
+                    wf.setsampwidth(cf.getsampwidth())
+                    wf.setframerate(cf.getframerate())
 
-        # Reset clips and total duration after concatenation
-        #self.clips.clear()
-        self.total_duration = 0
-        self.clips.clear()
+                for clip in self.clips:
+                    with wave.open(clip, 'rb') as cf:
+                        frames = cf.readframes(cf.getnframes())
+                        wf.writeframes(frames)
+        except Exception as e:
+            logging.error(f"concatenate_clips failed: {e}")
+            return None
+        finally:
+            # Reset state whether success or failure
+            self.total_duration = 0.0
+            self.clips.clear()
 
         return output_path
 
@@ -156,48 +214,64 @@ class AudioRecorderWithVAD:
         return self.vad.is_speech(frame, self.rate)
 
     def record_with_vad(self, initial_silence_timeout=15, max_silence_length=1):
-        """Record audio and stop when speech ends, with handling for initial silence."""
+        """Record audio and stop when speech ends, with handling for initial silence and IO errors."""
+        os.makedirs("RecordedAudio", exist_ok=True)
         stream = self.p.open(format=self.format, channels=self.channels, rate=self.rate, input=True, frames_per_buffer=self.frames_per_buffer)
         audio_frames = []
         silent_frames = collections.deque(maxlen=int(self.rate / self.frames_per_buffer * max_silence_length))
         initial_timeout_frames = int(self.rate / self.frames_per_buffer * initial_silence_timeout)
 
-        for _ in range(initial_timeout_frames):
-            frame = stream.read(self.frames_per_buffer)
-            if self.is_speech(frame):
-                audio_frames.append(frame)
-                break
-            else:
-                silent_frames.append(frame)
+        try:
+            # Wait for initial speech up to timeout
+            for _ in range(initial_timeout_frames):
+                try:
+                    frame = stream.read(self.frames_per_buffer, exception_on_overflow=False)
+                except Exception as e:
+                    logging.warning(f"Audio read error (initial): {e}")
+                    continue
+                if self.is_speech(frame):
+                    audio_frames.append(frame)
+                    break
+                else:
+                    silent_frames.append(frame)
 
-        if not audio_frames:  # No speech was detected within the initial timeout
+            if not audio_frames:  # No speech detected
+                return None
+
+            # Continue recording until trailing silence reached
+            while True:
+                try:
+                    frame = stream.read(self.frames_per_buffer, exception_on_overflow=False)
+                except Exception as e:
+                    logging.warning(f"Audio read error (recording): {e}")
+                    if audio_frames:
+                        break
+                    else:
+                        return None
+                if self.is_speech(frame):
+                    audio_frames.append(frame)
+                    silent_frames.clear()
+                else:
+                    silent_frames.append(frame)
+                    if len(silent_frames) == silent_frames.maxlen:
+                        break
+        finally:
             stream.stop_stream()
             stream.close()
-            return None  # Indicate that no valid audio was recorded
 
-        # Continue recording after speech detection
-        while True:
-            frame = stream.read(self.frames_per_buffer)
-            if self.is_speech(frame):
-                audio_frames.append(frame)
-                silent_frames.clear()
-            else:
-                silent_frames.append(frame)
-                if len(silent_frames) == silent_frames.maxlen:
-                    break
-        
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         output_path = f"RecordedAudio/audio_{timestamp}.wav"
 
-        stream.stop_stream()
-        stream.close()
+        try:
+            with wave.open(output_path, 'wb') as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(self.p.get_sample_size(self.format))
+                wf.setframerate(self.rate)
+                wf.writeframes(b''.join(audio_frames))
+        except Exception as e:
+            logging.error(f"Failed to write WAV: {e}")
+            return None
 
-        wf = wave.open(output_path, 'wb')
-        wf.setnchannels(self.channels)
-        wf.setsampwidth(self.p.get_sample_size(self.format))
-        wf.setframerate(self.rate)
-        wf.writeframes(b''.join(audio_frames))
-        wf.close()
         return output_path
 
 class ArduinoControl:
@@ -790,46 +864,246 @@ class AIInteraction:
     @staticmethod
     def process_voice_cloning(session_manager: SessionAudioManager, shouldThread: bool):
         concatenated_path = session_manager.concatenate_clips()
+        if not concatenated_path:
+            logging.info("Voice cloning skipped: no audio to send")
+            return None
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         if shouldThread:
             cloning_thread = threading.Thread(
                 target=VoiceCloning.send_audio_for_cloning,
                 args=(concatenated_path, f'session_clone{timestamp}')
-)
+            )
             cloning_thread.daemon = True
-        
-            print("Voice cloning started in the background...")
+            logging.info("Voice cloning started in background thread")
             return cloning_thread
         else:
             VoiceCloning.send_audio_for_cloning(fileLocation=concatenated_path, voiceName=f'session_clone{timestamp}')
-      
+            return None
+
+# --------------------------------------------------------------
+# TTS Engine Abstraction (Scaffolding for PlayHT / ElevenLabs)
+# --------------------------------------------------------------
+class TTSEngine:
+    """Abstract TTS Engine interface."""
+    def stream_text(self, text: str):
+        raise NotImplementedError
+
+    def clone_from_file(self, file_path: str, voice_name: str):
+        """Clone a voice from a local audio file. Should return a voice id/url or None."""
+        raise NotImplementedError
+
+class PlayHTEngine(TTSEngine):
+    """Adapter over existing PlayHT code paths (VoiceCloning + AudioStreamer)."""
+    def stream_text(self, text: str):
+        # Use the same streamed playback path and the most recent clone
+        voice_url = voice_clone_manager.get_recent_clone_url()
+        if not voice_url:
+            logging.warning("PlayHTEngine.stream_text: no recent clone available; text will be skipped")
+            return
+        try:
+            streamer = AudioStreamer()
+            streamer.stream_audio(text, voice_url)
+        except Exception as e:
+            logging.error(f"PlayHTEngine.stream_text failed: {e}")
+
+    def clone_from_file(self, file_path: str, voice_name: str):
+        try:
+            VoiceCloning.send_audio_for_cloning(fileLocation=file_path, voiceName=voice_name)
+            return voice_name  # we store name->id mapping inside VoiceCloneManager
+        except Exception as e:
+            logging.error(f"PlayHTEngine.clone_from_file failed: {e}")
+            return None
+
+class ElevenLabsEngine(TTSEngine):
+    """Streaming-first ElevenLabs TTS with buffered fallback."""
+
+    def stream_text(self, text: str):
+        """
+        Prefer ElevenLabs streaming (low latency), fall back to buffered convert if needed.
+        Uses most-recent ElevenLabs clone if available, else ELEVENLABS_VOICE_ID.
+        """
+        try:
+            # 1) Choose voice
+            recent_id = voice_clone_manager.get_recent_clone_id(engine="elevenlabs")
+            env_id = os.getenv("ELEVENLABS_VOICE_ID")
+            voice_id = recent_id or env_id
+            if not voice_id:
+                logging.warning("ElevenLabsEngine.stream_text: no ELEVENLABS voice available (no recent clone and no ELEVENLABS_VOICE_ID); skipping playback")
+                return
+            logging.info(f"ElevenLabsEngine.stream_text (streaming) using voice_id={voice_id} (source={'recent' if recent_id else 'env'})")
+
+            # 2) Low-latency model & compact format for streaming; override via env if desired
+            model_id = os.getenv("ELEVENLABS_TTS_MODEL_STREAM", os.getenv("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"))
+            output_format = os.getenv("ELEVENLABS_TTS_FORMAT_STREAM", "mp3_22050_32")
+
+            # 3) Build voice settings (env-overridable). We accept either dict or EL_VoiceSettings
+            settings = {
+                "use_speaker_boost": (os.getenv("ELEVENLABS_SPEAKER_BOOST", "false").lower() in ("1","true","yes","y")),
+                "stability": float(os.getenv("ELEVENLABS_STABILITY", "0.5")),
+                "similarity_boost": float(os.getenv("ELEVENLABS_SIMILARITY", "0.8")),
+                "style": float(os.getenv("ELEVENLABS_STYLE", "0.1")),
+                "speed": float(os.getenv("ELEVENLABS_SPEED", "1.0")),
+            }
+            voice_settings = EL_VoiceSettings(**settings) if EL_VoiceSettings else settings
+
+            # 4) STREAMING PATH
+            try:
+                audio_stream = elevenlabs.text_to_speech.stream(
+                    text=text,
+                    voice_id=voice_id,
+                    model_id=model_id,
+                    output_format=output_format,
+                    voice_settings=voice_settings,
+                )
+
+                # 4a) If the SDK's local streamer is available, use it (lowest effort)
+                if el_stream and callable(el_stream):
+                    el_stream(audio_stream)
+                    return
+
+                # 4b) Fallback: write streamed chunks to a temp file progressively, then play
+                import tempfile
+                suffix = ".mp3" if "mp3" in output_format else ".wav"
+                with tempfile.NamedTemporaryFile(prefix="11l_stream_", suffix=suffix, delete=False) as tf:
+                    for chunk in audio_stream:
+                        if chunk:
+                            tf.write(chunk)
+                    tmp_path = tf.name
+                _play_file_best_effort(tmp_path, codec_hint=("mp3" if suffix==".mp3" else "wav"))
+                return
+            except Exception as se:
+                logging.warning(f"ElevenLabsEngine.stream_text: streaming failed ({se}); falling back to buffered convert")
+
+            # 5) BUFFERED FALLBACK (previous behaviour)
+            model_id_fb = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2")
+            output_format_fb = os.getenv("ELEVENLABS_TTS_FORMAT", "mp3_44100_128")
+            audio = elevenlabs.text_to_speech.convert(
+                text=text,
+                voice_id=voice_id,
+                model_id=model_id_fb,
+                output_format=output_format_fb,
+                voice_settings=voice_settings,
+            )
+
+            # Buffer generator → bytes
+            if isinstance(audio, (bytes, bytearray)):
+                buf = bytes(audio)
+            else:
+                buf_bytes = bytearray()
+                for chunk in audio:
+                    if chunk:
+                        buf_bytes.extend(chunk)
+                buf = bytes(buf_bytes)
+
+            # Try SDK play helper; if absent, use system fallback
+            try:
+                if el_play is not None:
+                    if callable(el_play):
+                        el_play(buf)
+                        return
+                    maybe_fn = getattr(el_play, 'play', None)
+                    if callable(maybe_fn):
+                        maybe_fn(buf)
+                        return
+                raise TypeError("elevenlabs.play helper unavailable or not callable")
+            except Exception as e:
+                logging.warning(f"ElevenLabsEngine.stream_text: elevenlabs.play fallback failed ({e}); using system player")
+                import tempfile
+                suffix = ".mp3" if "mp3" in output_format_fb else ".wav"
+                with tempfile.NamedTemporaryFile(prefix='11l_tts_', suffix=suffix, delete=False) as tf:
+                    tf.write(buf)
+                    tmp_path = tf.name
+                _play_file_best_effort(tmp_path, codec_hint=("mp3" if suffix==".mp3" else "wav"))
+
+        except Exception as e:
+            logging.error(f"ElevenLabsEngine.stream_text failed: {e}")
+
+    def clone_from_file(self, file_path: str, voice_name: str):
+        """Create an ElevenLabs instant voice clone from a local file and store the id."""
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            voice = elevenlabs.voices.ivc.create(
+                name=voice_name,
+                files=[BytesIO(data)],
+            )
+            voice_id = getattr(voice, "voice_id", None) or getattr(voice, "id", None)
+            if not voice_id:
+                logging.error("ElevenLabsEngine.clone_from_file: no voice_id returned")
+                return None
+
+            voice_clone_manager.add_new_clone(voice_name, voice_id, engine="elevenlabs")
+            logging.info(f"ElevenLabs clone created: {voice_name} -> {voice_id}")
+            return voice_id
+        except Exception as e:
+            logging.error(f"ElevenLabsEngine.clone_from_file failed: {e}")
+            return None
+
+def get_tts_engine() -> TTSEngine:
+    if TTS_ENGINE == 'elevenlabs':
+        logging.info("TTS engine: ElevenLabs (scaffold)")
+        return ElevenLabsEngine()
+    logging.info("TTS engine: PlayHT")
+    return PlayHTEngine()
+
+# Global engine instance and convenience helpers
+_tts_engine: TTSEngine = get_tts_engine()
+
+def tts_speak(text: str):
+    """Speak text using the selected engine (no behaviour change for PlayHT)."""
+    try:
+        _tts_engine.stream_text(text)
+    except Exception as e:
+        logging.error(f"tts_speak failed: {e}")
+
+def tts_clone_from_session(session_manager: 'SessionAudioManager', threaded: bool = True):
+    """Clone using accumulated session clips via the selected engine. Uses background thread when requested."""
+    concatenated_path = session_manager.concatenate_clips()
+    if not concatenated_path:
+        logging.info("tts_clone_from_session: no audio to clone")
+        return None
+
+    def _do_clone():
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        _tts_engine.clone_from_file(concatenated_path, f'session_clone{ts}')
+
+    if threaded:
+        th = threading.Thread(target=_do_clone, daemon=True)
+        th.start()
+        return th
+    else:
+        _do_clone()
+        return None
+
+
+
 class VoiceCloning:
     @staticmethod
     def send_audio_for_cloning(fileLocation, voiceName):
-        files = {"sample_file": (fileLocation, open(fileLocation, "rb"), "audio/x-m4a")}
-        payload = { "voice_name": voiceName }
         headers = {
             "accept": "application/json",
             "AUTHORIZATION": api_key_manager.get_current_key(),
             "X-USER-ID": api_key_manager.get_current_user_id()
         }
-
+        payload = {"voice_name": voiceName}
         try:
-            response = requests.post(url, data=payload, files=files, headers=headers, timeout=10)  # Timeout set to 10 seconds
-            response.raise_for_status()  # Check if the request was successful
-            voice_url = errorCatching.extract_voice_id(response)
-            voice_clone_manager.add_new_clone(voiceName, voice_url)
+            with open(fileLocation, "rb") as f:
+                files = {"sample_file": (os.path.basename(fileLocation), f, "audio/wav")}
+                response = requests.post(url, data=payload, files=files, headers=headers, timeout=15)
+            response.raise_for_status()
+            voice_id = errorCatching.extract_voice_id(response)
+            voice_clone_manager.add_new_clone(voiceName, voice_id, engine='playht')
+            logging.info(f"Cloned voice created: {voiceName} -> {voice_id}")
         except requests.exceptions.Timeout:
-            logging.error("The request timed out")
+            logging.error("send_audio_for_cloning: request timed out")
         except requests.exceptions.RequestException as e:
-            # Handle other request exceptions (e.g., HTTPError, ConnectionError, etc.)
-            logging.error(f"Error in voice cloning: {e}")
-            if response.status_code == 403:
-                voice_clone_manager.delete_oldest_clone()
+            status = getattr(e.response, 'status_code', None)
+            logging.error(f"send_audio_for_cloning error: {e}")
+            if status == 403:
+                voice_clone_manager.delete_oldest_clone(engine='playht')
                 api_key_manager.switch_key()
-                
-        finally:
-            files["sample_file"][1].close()  # Ensure the file is closed properly
+        except Exception as e:
+            logging.error(f"send_audio_for_cloning unexpected error: {e}")
 
 #Maaging Saved Clones
 class VoiceCloneManager:
@@ -843,52 +1117,61 @@ class VoiceCloneManager:
 
 
     def sync_with_api(self):
-        """Synchronize the internal state with the Play.ht API."""
         existing_clones = fetch_cloned_voices()
         for clone in existing_clones:
-            if not any(c['id'] == clone['id'] for c in self.clones):
-                self.clones.append(clone)
+            normalized = {
+                'name': clone.get('name'),
+                'id': clone.get('id'),
+                'engine': 'playht',
+                'created_at': time.time()
+            }
+            if not any(c['id'] == normalized['id'] for c in self.clones):
+                self.clones.append(normalized)
         self.save_clones()
             
 
-    def add_new_clone(self, voice_id, voice_url):
-        """Add a new voice clone and manage the capacity."""
+    def add_new_clone(self, voice_name, voice_id, engine: str = 'playht'):
         current_time = time.time()
         try:
             if len(self.clones) >= self.capacity:
-                self.delete_oldest_clone()  # Ensure capacity is not exceeded
-
+                # Evict within same engine pool if possible
+                self.delete_oldest_clone(engine=engine)
         except Exception as e:
-            print (e)
-
+            logging.error(f"Capacity management error: {e}")
 
         self.clones.append({
-            'name': voice_id,
-            'id': voice_url,
+            'name': voice_name,
+            'id': voice_id,
+            'engine': engine,
             'created_at': current_time
         })
         self.save_clones()
-        self.recent_clone = self.get_recent_clone_id()
-        print(f"recent clone id {self.get_recent_clone_id()}")
+        self.recent_clone = self.get_recent_clone_id(engine=engine)
+        logging.info(f"recent {engine} clone id {self.recent_clone}")
         
     def sync_state(self):
         #with self.lock:
             self.load_clones()  # Reload or re-synchronize the state   
 
-    def delete_oldest_clone(self):
-        """Remove the oldest voice clone."""
-        if self.clones:
-            oldest_clone = self.clones.popleft()
-            for _ in range(3):  # Retry up to 3 times
-                try:
-                    delete_clone_by_id(oldest_clone['id'])
-                    self.save_clones()
-                    return
-                except Exception as e:
-                    logging.error(f"Error deleting clone: {e}")
-                    time.sleep(1)  # Wait a bit before retrying
-            logging.error(f"Failed to delete clone with ID: {oldest_clone['id']} after multiple attempts")
-    
+    def delete_oldest_clone(self, engine: Optional[str] = None):
+        """Remove the oldest voice clone, optionally restricted to an engine (playht/elevenlabs)."""
+        if not self.clones:
+            return
+        candidates = [c for c in self.clones if (engine is None or c.get('engine', 'playht') == engine)]
+        if not candidates:
+            return
+        oldest = min(candidates, key=lambda c: c.get('created_at', 0))
+        try:
+            if oldest.get('engine', 'playht') == 'playht':
+                delete_clone_by_id(oldest['id'])
+        except Exception as e:
+            logging.error(f"Error deleting clone via API: {e}")
+        try:
+            self.clones.remove(oldest)
+        except ValueError:
+            pass
+        self.save_clones()
+        
     def save_clones(self):
         try:
             with open(self.storage_file, 'w') as file:
@@ -896,23 +1179,62 @@ class VoiceCloneManager:
         except Exception as e:
             logging.error(f"Error saving clones: {e}")
 
-    def get_recent_clone_id(self, index: int = 1) -> str:
-        if len(self.clones) >= index:
-            return self.clones[-index]['id']
+    def get_recent_clone_id(self, index: int = 1, engine: str = 'playht') -> Optional[str]:
+        filtered = [c for c in self.clones if c.get('engine', 'playht') == engine]
+        if len(filtered) >= index:
+            return filtered[-index]['id']
         return None
-        
-    def get_recent_clone_url(self, index: int = 1) -> str:
-        if len(self.clones) >= index:
-            return self.clones[-index]['id']
+
+    def get_recent_clone_url(self, index: int = 1, engine: str = 'playht') -> Optional[str]:
+        # For PlayHT, the "url" we store is the id used by their API
+        filtered = [c for c in self.clones if c.get('engine', 'playht') == engine]
+        if len(filtered) >= index:
+            return filtered[-index]['id']
         return None
         
     def load_clones(self):
+        """
+        Load clones from disk and upgrade legacy entries (missing 'engine').
+        We try to determine the correct engine by:
+          1) Checking against current PlayHT clone IDs from API,
+          2) Heuristics on the ID format as a fallback.
+        This allows us to remember the last ElevenLabs clone on first load.
+        """
         try:
             with open(self.storage_file, 'r') as file:
                 clones_list = json.load(file)
-                self.clones.extend(clones_list)
         except (FileNotFoundError, json.JSONDecodeError) as e:
             logging.warning(f"Error loading clones: {e}")
+            return
+        # Build PlayHT id set (best-effort)
+        playht_ids = set()
+        try:
+            playht_ids = {v['id'] for v in fetch_cloned_voices()}
+        except Exception as e:
+            logging.warning(f"Could not fetch PlayHT voices to upgrade legacy clones: {e}")
+        def _guess_engine(vid: str) -> str:
+            # If we know it's PlayHT, trust that.
+            if vid in playht_ids:
+                return 'playht'
+            # Heuristic: ElevenLabs ids are often short (≈20-24) alphanumerics without dashes.
+            # PlayHT ids are commonly UUID-like or longer/random; may contain dashes.
+            if '-' in vid:
+                return 'playht'
+            if 18 <= len(vid) <= 24 and vid.isalnum():
+                return 'elevenlabs'
+            # Default to playht if uncertain
+            return 'playht'
+        upgraded = []
+        upgraded_count = 0
+        for c in clones_list:
+            if 'engine' not in c or not c.get('engine'):
+                c['engine'] = _guess_engine(c.get('id', ''))
+                upgraded_count += 1
+            upgraded.append(c)
+        if upgraded_count:
+            logging.info(f"Upgraded {upgraded_count} legacy clone entries with inferred engines")
+        # Extend deque preserving order from disk (oldest→newest)
+        self.clones.extend(upgraded)
 
     def get_clone_info(self):
         """Get information about all stored clones."""
@@ -1003,29 +1325,40 @@ class localAiHandler:
 
 #OpenAi Api Refrencing
 class OpenAIHandler:
-
     def transcribe_audio(self, audio_path):
-        """
-        Transcribes audio to text using OpenAI's Whisper model.
-        """
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=open(audio_path, "rb"),
-            
-        )
-        transcription = response.text
-        return transcription
+        """Transcribes audio to text using OpenAI's Whisper model with simple retry/backoff."""
+        max_attempts = 5
+        base_sleep = 0.75
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with open(audio_path, "rb") as f:
+                    response = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                    )
+                return response.text
+            except Exception as e:
+                wait = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                logging.warning(f"transcribe_audio attempt {attempt} failed: {e}; retrying in {wait:.2f}s")
+                time.sleep(wait)
+        logging.error("transcribe_audio failed after retries; returning empty transcription")
+        return ""
 
-    def get_ai_response(self, transcription):
-        """
-        Generates a response using OpenAI's GPT-4o Turbo based on the given transcription.
-        """
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=transcription
-            
-        )
-        return response.choices[0].message.content
+    def get_ai_response(self, messages_or_text):
+        """Get a chat completion using either a list of messages or a raw text prompt."""
+        if isinstance(messages_or_text, str):
+            messages = [{"role": "user", "content": messages_or_text}]
+        else:
+            messages = messages_or_text
+        try:
+            response = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logging.error(f"Error getting AI response: {e}")
+            return ""
 
 #voice clone ai
 class PlayHTVoiceSynthesizer:
@@ -1088,13 +1421,10 @@ class PlayHTVoiceSynthesizer:
 class errorCatching:
 
     def extract_voice_id(json_response):
-
         try:
-
             if json_response.status_code == 403:
-                voice_clone_manager.delete_oldest_clone()
+                voice_clone_manager.delete_oldest_clone(engine='playht')
                 raise PermissionError("403 Forbidden: Too many voice clones, consider deleting some.")
-               
             elif json_response.status_code != 200:
                 # Handle other HTTP errors
                 json_response.raise_for_status()
@@ -1173,7 +1503,7 @@ def ring_cycle():
     ring_secs  = (ring_clip.length  / tempo) * 60.0
     song_secs  = (music_clip.length / tempo) * 60.0
     mid_gap    = 0.5
-    streamer   = streamer = AudioStreamerBlackHole(api_key_manager.get_current_user_id(),api_key_manager.get_current_key())
+    streamer = AudioStreamerBlackHole(api_key_manager.get_current_user_id(), api_key_manager.get_current_key())
     messages   = ["hello","I'm here","pick up","can you hear me","where","answer the call"]
     seg        = song_secs / 4
 
@@ -1337,6 +1667,7 @@ def test_full_interaction_cycle():
     log = FileManager("savedChats.txt")
     dataLog = FileManager("savedInfo.txt")
     streamer = AudioStreamer()
+    logging.info("Startup checks: directories present and voice clone state synced")
 
     threads = []
     loop = True
@@ -1380,7 +1711,7 @@ def test_full_interaction_cycle():
     arduino.led_Off()
     arduino.led_speaking()
     
-    streamer.stream_audio(gptGreetings[0],voice_clone_manager.get_recent_clone_url())
+    tts_speak(gptGreetings[0])
 
     try:
         while loop:
@@ -1399,7 +1730,7 @@ def test_full_interaction_cycle():
             #Check if any audio is returned
             if audio_path is None:
                 afk = ["Are you still there?","Hello?","Anyone there?","Can you hear me?"]
-                streamer.stream_audio(afk[1],voice_clone_manager.get_recent_clone_url())
+                tts_speak(afk[1])
                 continue
             else:
                 session_manager.add_clip(audio_path)
@@ -1414,9 +1745,9 @@ def test_full_interaction_cycle():
                 session.add_system_message(GPTinstructionsCloned[j])
                 if j < (len(GPTinstructionsCloned)-1):
                     j += 1
-                aiThread = AIInteraction.process_voice_cloning(session_manager, shouldThread=True)
-                threads.append(aiThread)
-                aiThread.start()
+                aiThread = tts_clone_from_session(session_manager, threaded=True)
+                if aiThread:
+                    threads.append(aiThread)
             
             if arduino.onHold():
                 break
@@ -1446,11 +1777,10 @@ def test_full_interaction_cycle():
 
             voice_clone_manager.sync_state() #Make sure clones are recent
 
-            streamer.stream_audio(response,voice_clone_manager.get_recent_clone_url()) #Stream recent audio
+            tts_speak(response)  # Stream via selected engine (PlayHT by default)
 
-            if True:
-                for thread in threads:
-                    thread.join()
+            # Prune finished cloning threads without blocking the loop
+            threads = [t for t in threads if t.is_alive()]
 
 
             if arduino.onHold():
