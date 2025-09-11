@@ -42,7 +42,7 @@ try:
 except Exception:
     EL_VoiceSettings = None
 from io import BytesIO
-from typing import AsyncGenerator, AsyncIterable, Generator, Iterable, Union, Optional
+from typing import AsyncGenerator, AsyncIterable, Generator, Iterable, Union, Optional, List
 import struct, binascii   # add at top of the file if not already there
 
 
@@ -174,6 +174,171 @@ class UIState:
 
 ui_state = UIState()
 
+# ---------------- Preset management ----------------
+class PresetManager:
+    def __init__(self, path: str = "presets.json"):
+        self.path = path
+        self.lock = threading.Lock()
+        self.presets = []
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            self.presets = data.get("presets", [])
+        except FileNotFoundError:
+            self.presets = []
+        except Exception as e:
+            logging.error(f"Failed to load presets: {e}")
+            self.presets = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"presets": self.presets}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Failed to save presets: {e}")
+
+    def list(self):
+        with self.lock:
+            def _key(p):
+                return (p.get("order", 0), p.get("created_at", 0))
+            return sorted(self.presets, key=_key)
+
+    def get(self, pid: str):
+        with self.lock:
+            for p in self.presets:
+                if p.get("id") == pid:
+                    return p
+        return None
+
+    def add_from_data(self, name: str, data: dict):
+        with self.lock:
+            now = time.time()
+            pid = f"p_{int(now*1000)}"
+            order = max([p.get("order", 0) for p in self.presets], default=0) + 1
+            preset = {
+                "id": pid,
+                "name": name or f"Preset {order}",
+                "starred": False,
+                "created_at": now,
+                "updated_at": now,
+                "order": order,
+                "data": data or {},
+            }
+            self.presets.append(preset)
+            self._save()
+            return preset
+
+    def delete(self, pid: str) -> bool:
+        with self.lock:
+            n = len(self.presets)
+            self.presets = [p for p in self.presets if p.get("id") != pid]
+            if len(self.presets) != n:
+                self._save()
+                return True
+            return False
+
+    def rename(self, pid: str, new_name: str) -> bool:
+        with self.lock:
+            for p in self.presets:
+                if p.get("id") == pid:
+                    p["name"] = new_name
+                    p["updated_at"] = time.time()
+                    self._save()
+                    return True
+            return False
+
+    def reorder(self, new_order_ids: List[str]) -> bool:
+        with self.lock:
+            id_to_p = {p["id"]: p for p in self.presets}
+            ordered = []
+            order_val = 1
+            for pid in new_order_ids:
+                if pid in id_to_p:
+                    p = id_to_p.pop(pid)
+                    p["order"] = order_val
+                    order_val += 1
+                    ordered.append(p)
+            leftovers = [p for p in self.presets if p["id"] in id_to_p]
+            for p in leftovers:
+                p["order"] = order_val
+                order_val += 1
+                ordered.append(p)
+            self.presets = ordered
+            self._save()
+            return True
+
+    def star(self, pid: str) -> bool:
+        with self.lock:
+            found = False
+            for p in self.presets:
+                if p.get("id") == pid:
+                    p["starred"] = True
+                    p["updated_at"] = time.time()
+                    found = True
+                else:
+                    p["starred"] = False
+            if found:
+                self._save()
+            return found
+
+    def starred(self):
+        with self.lock:
+            for p in self.presets:
+                if p.get("starred", False):
+                    return p
+        return None
+
+preset_manager = PresetManager()
+
+def export_settings_for_preset() -> dict:
+    """Snapshot of the current tunables for presets."""
+    try:
+        return {
+            "engine": ui_state.engine,
+            "audio_output": ui_state.audio_output,
+            "streaming": ui_state.streaming,
+            "playht": dict(ui_state.playht.__dict__),
+            "elevenlabs": dict(ui_state.elevenlabs.__dict__),
+            "vad": dict(ui_state.vad.__dict__),
+        }
+    except Exception:
+        return {}
+
+def apply_settings_from_preset(settings: dict):
+    """Apply preset settings to ui_state."""
+    if not settings:
+        return
+    try:
+        eng = settings.get("engine")
+        if eng:
+            ui_state.engine = eng
+        ao = settings.get("audio_output")
+        if ao:
+            ui_state.audio_output = ao
+        if "streaming" in settings:
+            ui_state.streaming = bool(settings.get("streaming"))
+        for sect in ("playht", "elevenlabs", "vad"):
+            vals = settings.get(sect)
+            if isinstance(vals, dict):
+                tgt = getattr(ui_state, sect, None)
+                if hasattr(tgt, "__dict__"):
+                    tgt.__dict__.update(vals)
+                else:
+                    setattr(ui_state, sect, vals)
+    except Exception as e:
+        logging.error(f"apply_settings_from_preset failed: {e}")
+
+def apply_initial_starred_preset():
+    try:
+        p = preset_manager.starred()
+        if p and isinstance(p.get("data"), dict):
+            logging.info(f"Applying starred preset on startup: {p.get('name')}")
+            apply_settings_from_preset(p["data"])
+    except Exception as e:
+        logging.warning(f"apply_initial_starred_preset skipped: {e}")
 
 def get_system_snapshot():
     snap = {
@@ -2502,6 +2667,71 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+            
+    @app.get("/presets")
+    def presets_list():
+        try:
+            return {"ok": True, "presets": preset_manager.list()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/presets")
+    def presets_add(payload: dict):
+        try:
+            from_current = bool(payload.get("from_current", False))
+            name = payload.get("name") or ""
+            data = export_settings_for_preset() if from_current else (payload.get("data") or {})
+            p = preset_manager.add_from_data(name=name, data=data)
+            return {"ok": True, "preset": p}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/presets/apply")
+    def presets_apply(payload: dict):
+        try:
+            pid = payload.get("id")
+            p = preset_manager.get(pid)
+            if not p:
+                return {"ok": False, "error": "not_found"}
+            apply_settings_from_preset(p.get("data") or {})
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.patch("/presets/{pid:path}")
+    def presets_patch(pid: str, payload: dict):
+        try:
+            ok = True
+            if "name" in payload:
+                ok = preset_manager.rename(pid, str(payload.get("name") or "").strip()) and ok
+            if "starred" in payload:
+                if bool(payload.get("starred")):
+                    ok = preset_manager.star(pid) and ok
+                else:
+                    cur = preset_manager.get(pid)
+                    if cur and cur.get("starred"):
+                        cur["starred"] = False
+                        preset_manager._save()
+            return {"ok": ok}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.delete("/presets/{pid:path}")
+    def presets_delete(pid: str):
+        try:
+            ok = preset_manager.delete(pid)
+            return {"ok": ok}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/presets/reorder")
+    def presets_reorder(payload: dict):
+        try:
+            order = payload.get("order") or []
+            ok = preset_manager.reorder(order)
+            return {"ok": ok}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     @app.get("/state")
     def get_state():
@@ -2635,6 +2865,11 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
             return {"ok": True, "count": len(voice_clone_manager.clones)}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+        
+    try:
+        apply_initial_starred_preset()
+    except Exception:
+        pass
 
     def _run():
         uvicorn.run(app, host=host, port=port, log_level="warning")
