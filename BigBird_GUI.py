@@ -173,6 +173,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_audio_btn = QtWidgets.QPushButton("Apply Audio")
         top.addWidget(self.apply_audio_btn)
 
+        # GUI overrides toggle — when off, backend ignores GUI/preset changes
+        self.override_chk = QtWidgets.QCheckBox("Overwrite script settings")
+        self.override_chk.setToolTip("When enabled, GUI and presets can change live TTS settings. When disabled, your script values stay authoritative.")
+        self.override_chk.setChecked(True)  # default matches backend's previous behavior
+        top.addWidget(self.override_chk)
+
         top.addStretch(1)
 
         # System info (cpu/mem/clones)
@@ -453,6 +459,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_eleven.clicked.connect(self.on_apply_eleven)
         self.apply_vad.clicked.connect(self.on_apply_vad)
         self.say_btn.clicked.connect(self.on_say)
+        self.override_chk.stateChanged.connect(self.on_toggle_overrides)
 
         self.start_api_btn.clicked.connect(self.on_start_api)
         self.stop_api_btn.clicked.connect(self.on_stop_api)
@@ -499,9 +506,34 @@ class MainWindow(QtWidgets.QMainWindow):
         # First refresh
         self.refresh_state()
 
+        # Ensure buttons match the current checkbox until state poll confirms
+        self._set_overrides_enabled(self.override_chk.isChecked())
+
         self._last_arduino = 0.0
         self._last_clones = 0.0
         self._last_presets = 0.0
+    def on_toggle_overrides(self, state):
+        enabled = bool(state)
+        res = api.post("/state/gui_overrides", {"enabled": enabled})
+        ok = res.get("ok", False)
+        self.status.showMessage(
+            "GUI overrides " + ("enabled" if enabled else "disabled") if ok else f"Error: {res.get('error','')}",
+            2000,
+        )
+        # Locally gray out Apply buttons if overrides are disabled
+        self._set_overrides_enabled(enabled)
+
+    def _set_overrides_enabled(self, enabled: bool):
+        """Enable/disable controls that push settings to the backend."""
+        for b in (
+            self.apply_engine_btn,
+            self.apply_audio_btn,
+            self.apply_playht,
+            self.apply_eleven,
+            self.apply_vad,
+            self.preset_apply_btn,
+        ):
+            b.setEnabled(bool(enabled))
 
 
     def on_hook_latch(self, which):
@@ -841,6 +873,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_if_idle(self.engine, self.engine.setCurrentText, data.get("engine", "playht"))
         self._set_if_idle(self.output, self.output.setCurrentText, data.get("audio_output", "default"))
         self._set_if_idle(self.streaming, self.streaming.setChecked, bool(data.get("streaming", True)))
+        # GUI overrides state (if backend exposes it)
+        if isinstance(data.get("gui_overrides"), bool):
+            ov = bool(data.get("gui_overrides"))
+            self._set_if_idle(self.override_chk, self.override_chk.setChecked, ov)
+            self._set_overrides_enabled(ov)
 
         sys = data.get("system", {})
         cpu = sys.get("cpu_percent", "—")

@@ -108,13 +108,13 @@ class PlayHTSettings:
 @dataclass
 class ElevenLabsSettings:
     use_speaker_boost: bool = False
-    stability: float = 1
+    stability: float = 0.5
     similarity_boost: float = 0.8
     style: float = 0.1
     speed: float = 1.0
-    model_id_stream: str = "eleven_v3"
+    model_id_stream: str = "eleven_flash_v2_5"
     format_stream: str = "mp3_22050_32"
-    model_id_buffered: str = "eleven_v3"
+    model_id_buffered: str = "eleven_multilingual_v2"
     format_buffered: str = "mp3_44100_128"
 
 @dataclass
@@ -464,11 +464,11 @@ def _play_file_best_effort(tmp_path: str, codec_hint: str = "mp3"):
             logging.error(f"No portable playback fallback for platform {sys.platform}. File saved at {tmp_path}")
     except Exception as e:
         logging.error(f"Fallback playback failed ({codec_hint}) at {tmp_path}: {e}")
-PLAYHT_API_KEYS = [os.getenv('PLAYHT_API_KEY_SPARE')]
-PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID_SPARE')]
+#PLAYHT_API_KEYS = [os.getenv('PLAYHT_API_KEY'), os.getenv('PLAYHT_API_KEY_SPARE')]
+#PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID'), os.getenv('PLAYHT_USER_ID_SPARE')]
 
-#PLAYHT_API_KEYS #= [os.getenv('PLAYHT_API_KEY')]
-#PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID')] 
+PLAYHT_API_KEYS = [os.getenv('PLAYHT_API_KEY')]
+PLAYHT_USER_IDS = [os.getenv('PLAYHT_USER_ID')] 
 
 # Engine selector (scaffolding for runtime swap)
 TTS_ENGINE = (os.getenv('TTS_ENGINE') or 'playht').strip().lower()
@@ -523,7 +523,7 @@ New = "RecordedAudio/New"
 SoundTrack = "/Users/x/myenv/bin/tester.wav"
 
 
-arduinoLocation = '/dev/tty.usbmodem744DBDA236D82'
+arduinoLocation = '/dev/cu.usbmodem8301'
 
 # ---------------- Arduino override & helpers ----------------
 _arduino_override = {"hook": None, "led": None}  # hook: "offhook"|"onhook"|None; led: "OFF"|"RECORDING"|"REPLYING"|"PROCESSING"|None
@@ -1601,22 +1601,9 @@ class PlayHTEngine(TTSEngine):
                         voice_url=voice_url,
                         voice_engine=os.getenv('PLAYHT_VOICE_ENGINE', 'PlayDialog')
                     )
+
         except Exception as e:
             logging.error(f"PlayHTEngine.stream_text failed: {e}")
-            # If PlayHT auth fails (e.g., v4 sdk-auth 403 Forbidden),
-            # switch to ElevenLabs for this utterance so the show continues.
-            msg = str(e)
-            if ("403" in msg or "Forbidden" in msg or "sdk-auth" in msg) and AUTO_FALLBACK_TO_ELEVENLABS:
-                try:
-                    ui_state.append_message("system", "PlayHT auth failed (403) — switching to ElevenLabs for this line.")
-                except Exception:
-                    pass
-                logging.warning("PlayHT auth failure detected; falling back to ElevenLabs for this utterance.")
-                try:
-                    ElevenLabsEngine().stream_text(text)
-                    return
-                except Exception as e2:
-                    logging.error(f"ElevenLabs fallback also failed: {e2}")
 
     def clone_from_file(self, file_path: str, voice_name: str):
         try:
