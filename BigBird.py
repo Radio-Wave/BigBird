@@ -1811,7 +1811,16 @@ def test_full_interaction_cycle():
 
 class FileManager:
     def __init__(self, filename):
-        self.filename = filename
+        # Anchor relative filenames at the project root so all processes agree
+        try:
+            from pathlib import Path
+            base_dir = Path(__file__).resolve().parent.parent
+        except Exception:
+            base_dir = None
+        if base_dir and not os.path.isabs(filename):
+            self.filename = str(base_dir / filename)
+        else:
+            self.filename = filename
 
     def write_text(self, text):
         """Write text to the file."""
@@ -2002,8 +2011,7 @@ if __name__ == "__main__":
         arduino = ArduinoControl(arduinoLocation)
 
         try:
-            while(True):
-    
+            while(True):   
 
                 test_full_interaction_cycle()
 

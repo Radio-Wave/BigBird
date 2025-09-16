@@ -3,6 +3,8 @@
 # Requires: pip install PySide6 requests
 
 from PySide6 import QtCore, QtGui, QtWidgets
+import json
+from pathlib import Path
 import requests
 import sys
 import os
@@ -36,6 +38,14 @@ class ApiClient:
     def post(self, path, payload):
         try:
             r = requests.post(self.base + path, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def patch(self, path, payload):
+        try:
+            r = requests.patch(self.base + path, json=payload, timeout=self.timeout)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -176,15 +186,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # GUI overrides toggle — when off, backend ignores GUI/preset changes
         self.override_chk = QtWidgets.QCheckBox("Overwrite script settings")
         self.override_chk.setToolTip("When enabled, GUI and presets can change live TTS settings. When disabled, your script values stay authoritative.")
-        self.override_chk.setChecked(True)  # default matches backend's previous behavior
+        self.override_chk.setChecked(False)  # default off: do not override on launch
         top.addWidget(self.override_chk)
 
         top.addStretch(1)
 
-        # System info (cpu/mem/clones)
+        # System info (cpu/mem/clones) + LED indicator
         self.sys_label = QtWidgets.QLabel("cpu: —   mem: —   clones: —")
         self.sys_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         top.addWidget(self.sys_label)
+        top.addSpacing(8)
+        top.addWidget(QtWidgets.QLabel("LED:"))
+        self.led_indicator = QtWidgets.QLabel()
+        self.led_indicator.setFixedSize(14, 14)
+        self.led_indicator.setToolTip("Current LED state")
+        self._set_led_indicator_color("OFF")
+        top.addWidget(self.led_indicator)
 
         # ---- Middle area: chat (left) + tabs (right) ----
         mid = QtWidgets.QHBoxLayout()
@@ -206,12 +223,12 @@ class MainWindow(QtWidgets.QMainWindow):
         speak_row.addWidget(self.say_btn)
 
         # Controls (tabs)
-        tabs = QtWidgets.QTabWidget()
-        mid.addWidget(tabs, 1)
+        self.tabs = QtWidgets.QTabWidget()
+        mid.addWidget(self.tabs, 1)
 
         # --- Presets tab ---
         self.presets_tab = QtWidgets.QWidget()
-        tabs.addTab(self.presets_tab, "Presets")
+        self.tabs.addTab(self.presets_tab, "Presets")
         pr = QtWidgets.QVBoxLayout(self.presets_tab)
 
         self.presets_table = QtWidgets.QTableWidget(0, 2)
@@ -234,9 +251,8 @@ class MainWindow(QtWidgets.QMainWindow):
         prow.addStretch(1)
         pr.addLayout(prow)
 
-        # --- PlayHT tab ---
+        # --- PlayHT panel (will be embedded under Show Control) ---
         self.playht_tab = QtWidgets.QWidget()
-        tabs.addTab(self.playht_tab, "PlayHT")
         pform = QtWidgets.QFormLayout(self.playht_tab)
 
         self.p_speed = add_row(pform, "Speed",
@@ -255,9 +271,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_playht = QtWidgets.QPushButton("Apply PlayHT")
         pform.addRow(self.apply_playht)
 
-        # --- ElevenLabs tab ---
+        # --- ElevenLabs panel (will be embedded under Show Control) ---
         self.eleven_tab = QtWidgets.QWidget()
-        tabs.addTab(self.eleven_tab, "ElevenLabs")
         eform = QtWidgets.QFormLayout(self.eleven_tab)
 
         self.e_boost = QtWidgets.QCheckBox("Enable speaker boost")
@@ -270,9 +285,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_eleven = QtWidgets.QPushButton("Apply ElevenLabs")
         eform.addRow(self.apply_eleven)
 
-        # --- VAD tab ---
+        # --- VAD panel (will be embedded under Show Control) ---
         self.vad_tab = QtWidgets.QWidget()
-        tabs.addTab(self.vad_tab, "VAD")
         vform = QtWidgets.QFormLayout(self.vad_tab)
 
         self.v_mode = add_row(vform, "Aggressiveness (0–3)",
@@ -285,9 +299,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_vad = QtWidgets.QPushButton("Apply VAD")
         vform.addRow(self.apply_vad)
 
-        # --- Arduino tab ---
+        # --- Arduino panel (will be embedded under Show Control) ---
         self.arduino_tab = QtWidgets.QWidget()
-        tabs.addTab(self.arduino_tab, "Arduino")
         aform = QtWidgets.QFormLayout(self.arduino_tab)
         self.ard_status = QtWidgets.QLabel("port: —   connected: —   override(hook/led): —/—")
         aform.addRow(self.ard_status)
@@ -348,9 +361,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ring_row.addWidget(self.ring_double_btn)
         aform.addRow(ring_row)
 
-        # --- Cloning tab ---
+        # --- Cloning panel (will be embedded under Show Control) ---
         self.cloning_tab = QtWidgets.QWidget()
-        tabs.addTab(self.cloning_tab, "Cloning")
         clform = QtWidgets.QVBoxLayout(self.cloning_tab)
 
         # Progress bar and info line
@@ -366,6 +378,8 @@ class MainWindow(QtWidgets.QMainWindow):
         info_row.addWidget(self.clone_counter)
         self.clone_pending = QtWidgets.QLabel("pending clips: 0")
         info_row.addWidget(self.clone_pending)
+        self.clone_total = QtWidgets.QLabel("total: 0.0s")
+        info_row.addWidget(self.clone_total)
         info_row.addStretch(1)
         clform.addLayout(info_row)
 
@@ -402,14 +416,59 @@ class MainWindow(QtWidgets.QMainWindow):
         self.identity_info.setMaximumHeight(140)
         clform.addWidget(self.identity_info)
 
+        # --- Show Control tab (consolidates PlayHT, ElevenLabs, VAD, Arduino, Cloning) ---
+        self.show_tab = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(self.show_tab)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+
+        def make_box(title: str, content_widget: QtWidgets.QWidget) -> QtWidgets.QGroupBox:
+            box = QtWidgets.QGroupBox(title)
+            v = QtWidgets.QVBoxLayout(box)
+            v.setContentsMargins(8, 6, 8, 8)
+            v.addWidget(content_widget)
+            return box
+
+        box_playht = make_box("PlayHT", self.playht_tab)
+        box_eleven = make_box("ElevenLabs", self.eleven_tab)
+        box_vad    = make_box("VAD", self.vad_tab)
+
+        # Director controls (admin override)
+        self.director_panel = QtWidgets.QWidget()
+        drow = QtWidgets.QHBoxLayout(self.director_panel)
+        self.btn_force_vad = QtWidgets.QPushButton("Trigger VAD End")
+        self.btn_force_vad.setToolTip("Force end-of-speech now (cut recording)")
+        drow.addWidget(self.btn_force_vad)
+        self.btn_abort_tts = QtWidgets.QPushButton("Abort AI, Resume VAD")
+        self.btn_abort_tts.setToolTip("Cut off current TTS playback and return to listening")
+        drow.addWidget(self.btn_abort_tts)
+        self.btn_end_conv = QtWidgets.QPushButton("End Conversation")
+        self.btn_end_conv.setToolTip("Trigger the conversation finished flow")
+        drow.addWidget(self.btn_end_conv)
+        drow.addStretch(1)
+        box_director = make_box("Director Controls", self.director_panel)
+
+        box_ardu   = make_box("Arduino", self.arduino_tab)
+        box_clone  = make_box("Cloning", self.cloning_tab)
+
+        grid.addWidget(box_playht, 0, 0)
+        grid.addWidget(box_eleven, 0, 1)
+        grid.addWidget(box_vad, 0, 2)
+        grid.addWidget(box_director, 1, 0, 1, 3)
+        grid.addWidget(box_ardu, 2, 0, 1, 3)
+        grid.addWidget(box_clone, 3, 0, 1, 3)
+
+        self.tabs.addTab(self.show_tab, "Show Control")
+
         # --- Clones tab ---
         self.clones_tab = QtWidgets.QWidget()
-        tabs.addTab(self.clones_tab, "Clones")
+        self.tabs.addTab(self.clones_tab, "Clones")
         cbox = QtWidgets.QVBoxLayout(self.clones_tab)
 
         # Table
-        self.clones_table = QtWidgets.QTableWidget(0, 5)
-        self.clones_table.setHorizontalHeaderLabels(["Name", "ID", "Engine", "Created", "Actions"])
+        self.clones_table = QtWidgets.QTableWidget(0, 6)
+        self.clones_table.setHorizontalHeaderLabels(["Name", "ID", "Engine", "Alias", "Created", "Actions"])
         self.clones_table.horizontalHeader().setStretchLastSection(True)
         self.clones_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.clones_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -425,6 +484,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clones_sync_btn.clicked.connect(self.on_clones_sync)
         cfooter.addWidget(self.clones_sync_btn)
 
+        self.clones_sync_all_btn = QtWidgets.QPushButton("Sync All")
+        self.clones_sync_all_btn.setToolTip("Fetch ElevenLabs voices for all aliases in keyring")
+        self.clones_sync_all_btn.clicked.connect(self.on_clones_sync_all)
+        cfooter.addWidget(self.clones_sync_all_btn)
+
         cfooter.addWidget(QtWidgets.QLabel("Evict oldest:"))
         self.clones_engine = QtWidgets.QComboBox()
         self.clones_engine.addItems(["All", "playht", "elevenlabs"])
@@ -433,12 +497,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clones_evict_btn.clicked.connect(self.on_clones_evict)
         cfooter.addWidget(self.clones_evict_btn)
 
+        # Alias filter
+        cfooter.addSpacing(12)
+        cfooter.addWidget(QtWidgets.QLabel("Alias:"))
+        self.clones_alias_filter = QtWidgets.QComboBox()
+        self.clones_alias_filter.addItems(["All", "Active"])  # dynamic aliases populated on render
+        self.clones_alias_filter.currentIndexChanged.connect(self.on_clones_alias_filter)
+        cfooter.addWidget(self.clones_alias_filter)
+
         cfooter.addStretch(1)
         cbox.addLayout(cfooter)
 
         # --- Logs tab ---
         self.logs_tab = QtWidgets.QWidget()
-        tabs.addTab(self.logs_tab, "Logs")
+        self.tabs.addTab(self.logs_tab, "Logs")
         lform = QtWidgets.QVBoxLayout(self.logs_tab)
         self.logs = QtWidgets.QPlainTextEdit()
         self.logs.setReadOnly(True)
@@ -467,6 +539,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clear_logs_btn.clicked.connect(self.logs.clear)
         self.clone_req_apply.clicked.connect(self.on_clone_threshold)
         self.clone_now_btn.clicked.connect(self.on_clone_now)
+        
+        # -------------------- Keys tab (ElevenLabs key manager) --------------------
+        self.keys_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.keys_tab, "Keys")
+        kroot = QtWidgets.QVBoxLayout(self.keys_tab)
+
+        ktop = QtWidgets.QHBoxLayout()
+        self.keys_filter = QtWidgets.QLineEdit()
+        self.keys_filter.setPlaceholderText("Filter by alias…")
+        self.keys_refresh_btn = QtWidgets.QPushButton("Refresh")
+        self.keys_add_btn = QtWidgets.QPushButton("Add Key")
+        self.keys_edit_btn = QtWidgets.QPushButton("Edit Limit")
+        self.keys_edit_used_btn = QtWidgets.QPushButton("Edit Used")
+        self.keys_setactive_btn = QtWidgets.QPushButton("Set Active")
+        self.keys_remove_btn = QtWidgets.QPushButton("Remove Selected")
+        for w in (self.keys_filter, self.keys_refresh_btn, self.keys_add_btn, self.keys_edit_btn, self.keys_edit_used_btn, self.keys_setactive_btn, self.keys_remove_btn):
+            ktop.addWidget(w)
+        kroot.addLayout(ktop)
+
+        self.keys_table = QtWidgets.QTableWidget(0, 8)
+        self.keys_table.setHorizontalHeaderLabels([
+            "Health", "Alias", "API Key", "IVC Limit", "Used", "Remaining", "Active", "Last Used",
+        ])
+        self.keys_table.horizontalHeader().setStretchLastSection(True)
+        self.keys_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.keys_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        kroot.addWidget(self.keys_table, 1)
+
+        self.keys_summary = QtWidgets.QLabel("")
+        kroot.addWidget(self.keys_summary)
+
+        # wire
+        self.keys_refresh_btn.clicked.connect(self.keys_refresh)
+        self.keys_filter.textChanged.connect(self.keys_refresh)
+        self.keys_add_btn.clicked.connect(self.keys_add)
+        self.keys_remove_btn.clicked.connect(self.keys_remove_selected)
+        self.keys_setactive_btn.clicked.connect(self.keys_set_active)
+        self.keys_edit_btn.clicked.connect(self.keys_edit_limit)
+        self.keys_edit_used_btn.clicked.connect(self.keys_edit_used)
+        # Director controls
+        self.btn_force_vad.clicked.connect(self.on_director_force_vad)
+        self.btn_abort_tts.clicked.connect(self.on_director_abort_tts)
+        self.btn_end_conv.clicked.connect(self.on_director_end_conv)
 
         # Preset actions
         self.preset_new_btn.clicked.connect(self.on_preset_new)
@@ -512,6 +627,265 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_arduino = 0.0
         self._last_clones = 0.0
         self._last_presets = 0.0
+        # Initialize keys view
+        try:
+            self.keys_refresh()
+        except Exception:
+            pass
+
+    # ----------------- ElevenLabs keyring helpers -----------------
+    @staticmethod
+    def _keyring_path() -> Path:
+        return Path.home() / ".bigbird" / "eleven_keyring.json"
+
+    @staticmethod
+    def _ensure_keyring():
+        p = MainWindow._keyring_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            data = {"keys": [], "month_anchor": time.strftime("%Y-%m"), "last_active_alias": None}
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _load_keyring() -> dict:
+        MainWindow._ensure_keyring()
+        try:
+            return json.loads(MainWindow._keyring_path().read_text(encoding="utf-8"))
+        except Exception:
+            return {"keys": [], "month_anchor": time.strftime("%Y-%m"), "last_active_alias": None}
+
+    @staticmethod
+    def _save_keyring(data: dict):
+        MainWindow._ensure_keyring()
+        MainWindow._keyring_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _redact(key: str) -> str:
+        if not key:
+            return "—"
+        if len(key) <= 10:
+            return key[0:2] + "…" + key[-2:]
+        return key[0:6] + "…" + key[-4:]
+
+    @staticmethod
+    def _rollover_month_if_needed(data: dict):
+        cur = time.strftime("%Y-%m")
+        if data.get("month_anchor") != cur:
+            for k in data.get("keys", []):
+                try:
+                    k["ivc_used_this_month"] = 0
+                except Exception:
+                    pass
+            data["month_anchor"] = cur
+
+    # ----------------- Keys tab actions -----------------
+    def keys_refresh(self):
+        data = self._load_keyring()
+        self._rollover_month_if_needed(data)
+        keys = list(data.get("keys", []))
+        flt = self.keys_filter.text().strip().lower()
+        if flt:
+            keys = [k for k in keys if flt in str(k.get("alias","")) .lower()]
+
+        self.keys_table.setRowCount(0)
+        for k in keys:
+            alias = k.get("alias", "")
+            api_key = k.get("api_key", "")
+            limit = int(k.get("ivc_monthly_limit", 0) or 0)
+            used = int(k.get("ivc_used_this_month", 0) or 0)
+            remaining = max(0, limit - used)
+            active = bool(k.get("active", False))
+            last_used = float(k.get("last_used_ts", 0.0) or 0.0)
+            last_str = time.strftime("%d/%m %H:%M", time.localtime(last_used)) if last_used > 0 else "—"
+
+            row = self.keys_table.rowCount()
+            self.keys_table.insertRow(row)
+            # Health as colored circle
+            color = "#c62828" if remaining <= 0 else ("#ef6c00" if (limit>0 and remaining/float(limit) < 0.2) else "#2e7d32")
+            w = QtWidgets.QFrame()
+            w.setFixedSize(14, 14)
+            w.setStyleSheet(f"border-radius:7px; border:1px solid #555; background-color: {color};")
+            self.keys_table.setCellWidget(row, 0, w)
+
+            self.keys_table.setItem(row, 1, QtWidgets.QTableWidgetItem(alias))
+            self.keys_table.setItem(row, 2, QtWidgets.QTableWidgetItem(self._redact(api_key)))
+            self.keys_table.setItem(row, 3, QtWidgets.QTableWidgetItem(str(limit)))
+            self.keys_table.setItem(row, 4, QtWidgets.QTableWidgetItem(str(used)))
+            self.keys_table.setItem(row, 5, QtWidgets.QTableWidgetItem(str(remaining)))
+            self.keys_table.setItem(row, 6, QtWidgets.QTableWidgetItem("Yes" if active else "No"))
+            self.keys_table.setItem(row, 7, QtWidgets.QTableWidgetItem(last_str))
+
+        # summary
+        active_alias = next((k.get("alias") for k in data.get("keys", []) if k.get("active")), data.get("last_active_alias") or "—")
+        active = next((k for k in data.get("keys", []) if k.get("active")), None)
+        remaining = "—"
+        if active:
+            limit = int(active.get("ivc_monthly_limit", 0) or 0)
+            used = int(active.get("ivc_used_this_month", 0) or 0)
+            remaining = max(0, limit - used)
+        self.keys_summary.setText(f"Active: {active_alias}  |  Remaining IVC: {remaining}  |  Keys: {len(data.get('keys', []))}")
+
+    def _keys_selected_alias(self):
+        sel = self.keys_table.selectionModel().selectedRows()
+        if not sel:
+            return None
+        row = sel[0].row()
+        it = self.keys_table.item(row, 1)
+        return it.text() if it else None
+
+    def keys_add(self):
+        # Inline Add dialog
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Add ElevenLabs Key")
+        alias = QtWidgets.QLineEdit()
+        key = QtWidgets.QLineEdit()
+        limit = QtWidgets.QSpinBox()
+        limit.setRange(1, 100000)
+        limit.setValue(95)
+        active = QtWidgets.QCheckBox("Make active")
+        form = QtWidgets.QFormLayout()
+        form.addRow("Alias", alias)
+        form.addRow("API Key", key)
+        form.addRow("IVC Limit", limit)
+        form.addRow("", active)
+        btns = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton("Add")
+        cancel = QtWidgets.QPushButton("Cancel")
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok); btns.addWidget(cancel)
+        root = QtWidgets.QVBoxLayout(dlg)
+        root.addLayout(form); root.addLayout(btns)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        a = alias.text().strip(); k = key.text().strip(); lim = int(limit.value()); make_active = bool(active.isChecked())
+        if not a or not k:
+            self.status.showMessage("Alias and API key required", 2000)
+            return
+        data = self._load_keyring()
+        if any(r.get("alias") == a for r in data.get("keys", [])):
+            self.status.showMessage("Alias already exists", 2000)
+            return
+        rec = {"alias": a, "api_key": k, "ivc_monthly_limit": lim, "ivc_used_this_month": 0, "active": False, "last_used_ts": 0.0, "voices_cache": {}}
+        data.setdefault("keys", []).append(rec)
+        if make_active or len(data["keys"]) == 1:
+            for r in data["keys"]:
+                r["active"] = (r.get("alias") == a)
+                if r["active"]:
+                    r["last_used_ts"] = time.time()
+            data["last_active_alias"] = a
+        self._rollover_month_if_needed(data)
+        self._save_keyring(data)
+        self.keys_refresh()
+
+    def keys_remove_selected(self):
+        alias = self._keys_selected_alias()
+        if not alias:
+            self.status.showMessage("Select a row to remove", 2000)
+            return
+        if QtWidgets.QMessageBox.question(self, "Confirm", f"Remove key '{alias}'?") != QtWidgets.QMessageBox.Yes:
+            return
+        data = self._load_keyring()
+        keys = [k for k in data.get("keys", []) if k.get("alias") != alias]
+        if data.get("last_active_alias") == alias:
+            data["last_active_alias"] = keys[0]["alias"] if keys else None
+        data["keys"] = keys
+        self._save_keyring(data)
+        self.keys_refresh()
+
+    def keys_set_active(self):
+        alias = self._keys_selected_alias()
+        if not alias:
+            self.status.showMessage("Select a row to set active", 2000)
+            return
+        data = self._load_keyring()
+        found = False
+        for k in data.get("keys", []):
+            if k.get("alias") == alias:
+                k["active"] = True
+                k["last_used_ts"] = time.time()
+                found = True
+            else:
+                k["active"] = False
+        if not found:
+            self.status.showMessage("Alias not found", 2000)
+            return
+        data["last_active_alias"] = alias
+        self._save_keyring(data)
+        self.keys_refresh()
+
+    def keys_edit_limit(self):
+        alias = self._keys_selected_alias()
+        if not alias:
+            self.status.showMessage("Select a row to edit", 2000)
+            return
+        data = self._load_keyring()
+        rec = next((k for k in data.get("keys", []) if k.get("alias") == alias), None)
+        if not rec:
+            self.status.showMessage("Key not found", 2000)
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Edit IVC Limit — {alias}")
+        spin = QtWidgets.QSpinBox(); spin.setRange(1, 100000); spin.setValue(int(rec.get("ivc_monthly_limit", 0) or 0))
+        form = QtWidgets.QFormLayout(); form.addRow("IVC Limit", spin)
+        btns = QtWidgets.QHBoxLayout(); ok = QtWidgets.QPushButton("Save"); cancel = QtWidgets.QPushButton("Cancel")
+        ok.clicked.connect(dlg.accept); cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok); btns.addWidget(cancel)
+        root = QtWidgets.QVBoxLayout(dlg); root.addLayout(form); root.addLayout(btns)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        rec["ivc_monthly_limit"] = int(spin.value())
+        self._save_keyring(data)
+        self.keys_refresh()
+
+    def keys_edit_used(self):
+        alias = self._keys_selected_alias()
+        if not alias:
+            self.status.showMessage("Select a row to edit used count", 2000)
+            return
+        data = self._load_keyring()
+        rec = next((k for k in data.get("keys", []) if k.get("alias") == alias), None)
+        if not rec:
+            self.status.showMessage("Key not found", 2000)
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Edit Used This Month — {alias}")
+        spin = QtWidgets.QSpinBox(); spin.setRange(0, 1000000); spin.setValue(int(rec.get("ivc_used_this_month", 0) or 0))
+        form = QtWidgets.QFormLayout(); form.addRow("IVC Used", spin)
+        btns = QtWidgets.QHBoxLayout(); ok = QtWidgets.QPushButton("Save"); cancel = QtWidgets.QPushButton("Cancel")
+        ok.clicked.connect(dlg.accept); cancel.clicked.connect(dlg.reject)
+        btns.addWidget(ok); btns.addWidget(cancel)
+        root = QtWidgets.QVBoxLayout(dlg); root.addLayout(form); root.addLayout(btns)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        rec["ivc_used_this_month"] = int(spin.value())
+        self._save_keyring(data)
+        self.keys_refresh()
+    def _set_led_indicator_color(self, state: str):
+        colors = {
+            "OFF": "#444",
+            "RECORDING": "#d9534f",  # red
+            "REPLYING": "#5bc0de",   # blue-ish
+            "PROCESSING": "#f0ad4e", # amber
+        }
+        c = colors.get((state or "").upper(), "#444")
+        self.led_indicator.setStyleSheet(
+            f"border-radius: 7px; background-color: {c}; border: 1px solid #222;"
+        )
+    def on_director_force_vad(self):
+        res = api.post("/control/vad/force-end", {}) or {}
+        ok = res.get("ok", False)
+        self.status.showMessage("VAD cut signaled" if ok else f"VAD cut error: {res.get('error','')}", 2000)
+
+    def on_director_abort_tts(self):
+        res = api.post("/control/abort-tts", {}) or {}
+        ok = res.get("ok", False)
+        self.status.showMessage("Playback abort signaled" if ok else f"Abort error: {res.get('error','')}", 2000)
+
+    def on_director_end_conv(self):
+        res = api.post("/control/conversation/end", {}) or {}
+        ok = res.get("ok", False)
+        self.status.showMessage("End conversation signaled" if ok else f"End error: {res.get('error','')}", 2000)
     def on_toggle_overrides(self, state):
         enabled = bool(state)
         res = api.post("/state/gui_overrides", {"enabled": enabled})
@@ -695,8 +1069,10 @@ class MainWindow(QtWidgets.QMainWindow):
         conn = st.get("connected", False)
         ov = st.get("override", {})
         hook = ov.get("hook", "auto")
-        led = ov.get("led", "auto")
+        led = ov.get("led", "OFF")
         self.ard_status.setText(f"port: {port}   connected: {conn}   override(hook/led): {hook}/{led}")
+        # update LED indicator
+        self._set_led_indicator_color(led or "OFF")
         val = "auto" if hook in (None, "auto") else str(hook)
         for btn, name in (
             (self.hook_auto_btn, "auto"),
@@ -709,13 +1085,53 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- Clones actions ----
     def populate_clones(self, clones):
+        # Update alias filter options dynamically
+        try:
+            aliases = sorted({(c.get("account_alias") or "—") for c in clones if (c.get("engine") or "").lower() == "elevenlabs"})
+        except Exception:
+            aliases = []
+        try:
+            cur = self.clones_alias_filter.currentText() if hasattr(self, 'clones_alias_filter') else "All"
+            items = ["All", "Active"] + [a for a in aliases if a not in ("All", "Active")]
+            if hasattr(self, 'clones_alias_filter'):
+                self.clones_alias_filter.blockSignals(True)
+                self.clones_alias_filter.clear()
+                self.clones_alias_filter.addItems(items)
+                # restore selection if possible
+                idx = self.clones_alias_filter.findText(cur)
+                if idx >= 0:
+                    self.clones_alias_filter.setCurrentIndex(idx)
+                self.clones_alias_filter.blockSignals(False)
+        except Exception:
+            pass
+
+        # Apply alias filter to ElevenLabs entries; PlayHT unaffected
+        selected = None
+        try:
+            selected = self.clones_alias_filter.currentText()
+        except Exception:
+            selected = "All"
+        active_alias = getattr(self, "_active_el_alias", "—")
+        def _keep(c):
+            eng = (c.get("engine") or "").lower()
+            if eng != "elevenlabs":
+                return True  # do not filter PlayHT
+            if selected == "All":
+                return True
+            alias = c.get("account_alias") or "—"
+            want = active_alias if selected == "Active" else selected
+            return alias == want
+
+        view = [c for c in clones if _keep(c)]
+
         self.clones_table.setRowCount(0)
-        for c in clones:
+        for c in view:
             row = self.clones_table.rowCount()
             self.clones_table.insertRow(row)
             name = c.get("name") or c.get("title") or "—"
             vid = c.get("id") or "—"
             eng = (c.get("engine") or c.get("provider") or "—").lower()
+            alias = c.get("account_alias") or "—"
             category = (c.get("category") or "").lower()
             is_owner = c.get("is_owner", None)
             raw_created = c.get("created_at") or c.get("created") or "—"
@@ -737,6 +1153,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it_name = QtWidgets.QTableWidgetItem(str(name))
             it_id = QtWidgets.QTableWidgetItem(str(vid))
             it_eng = QtWidgets.QTableWidgetItem(str(eng_display))
+            it_alias = QtWidgets.QTableWidgetItem(str(alias))
             it_cr = QtWidgets.QTableWidgetItem(str(formatted_created))
             it_cr.setToolTip(str(raw_created))
             # stash id on the first item for convenience
@@ -744,7 +1161,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.clones_table.setItem(row, 0, it_name)
             self.clones_table.setItem(row, 1, it_id)
             self.clones_table.setItem(row, 2, it_eng)
-            self.clones_table.setItem(row, 3, it_cr)
+            self.clones_table.setItem(row, 3, it_alias)
+            self.clones_table.setItem(row, 4, it_cr)
 
             # actions
             cell = QtWidgets.QWidget()
@@ -764,7 +1182,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 btn_del.clicked.connect(functools.partial(self.on_clone_delete, vid))
             h.addWidget(btn_del)
             h.addStretch(1)
-            self.clones_table.setCellWidget(row, 4, cell)
+            self.clones_table.setCellWidget(row, 5, cell)
+
+    def on_clones_sync_all(self):
+        res = api.post("/clones/sync-all", {})
+        ok = res.get("ok", False)
+        self.status.showMessage("Clones synced (all aliases)" if ok else f"Sync-all error: {res.get('error','')}", 2000)
+        self.refresh_clones_now()
+
+    def on_clones_alias_filter(self):
+        # Re-render table using cached items
+        try:
+            self.populate_clones(getattr(self, "_last_clones_items", []) or [])
+        except Exception:
+            pass
 
     def on_clone_delete(self, voice_id):
         if not voice_id:
@@ -889,7 +1320,13 @@ class MainWindow(QtWidgets.QMainWindow):
         ph = split.get("playht")
         el = split.get("elevenlabs")
         split_str = f" (PH:{ph or 0} EL:{el or 0})" if (isinstance(ph, int) or isinstance(el, int)) else ""
-        self.sys_label.setText(f"cpu: {cpu}%   mem: {mem}   clones: {clones}{split_str}")
+        ek = data.get("elevenlabs_keyring", {}) or {}
+        ek_alias = ek.get("active_alias", "—")
+        ek_rem = ek.get("remaining_ivc", "—")
+        ek_str = f"   EL: {ek_alias} rem:{ek_rem}"
+        self.sys_label.setText(f"cpu: {cpu}%   mem: {mem}   clones: {clones}{split_str}{ek_str}")
+        # remember active EL alias for filtering
+        self._active_el_alias = ek.get("active_alias", "—") if isinstance(ek, dict) else "—"
 
         # chat
         self.chat.render_messages(data.get("messages", []))
@@ -926,12 +1363,27 @@ class MainWindow(QtWidgets.QMainWindow):
         sess = int(cloning.get("clones_in_session", 0) or 0)
         pend = int(cloning.get("pending_clips", 0) or 0)
         ident = cloning.get("identity_info") or ""
+        total_conv = float(cloning.get("conversation_seconds", 0.0) or 0.0)
 
-        # UI updates
-        self.clone_bar.setValue(int(max(0, min(100, round(pct * 100)))))
+        # Recording status: blend live elapsed into a greyed-out bar when active
+        rec = data.get("recording", {}) or {}
+        live_active = bool(rec.get("active", False))
+        live_elapsed = float(rec.get("elapsed", 0.0) or 0.0)
+        live_pct = pct
+        if live_active and req > 0:
+            live_pct = max(0.0, min(1.0, (col + live_elapsed) / req))
+
+        if live_active:
+            self.clone_bar.setStyleSheet("QProgressBar::chunk { background-color: #9aa0a6; }")
+            self.clone_bar.setValue(int(max(0, min(100, round(live_pct * 100)))))
+        else:
+            self.clone_bar.setStyleSheet("")
+            self.clone_bar.setValue(int(max(0, min(100, round(pct * 100)))))
+
         self.clone_info.setText(f"{col:.1f}/{req:.1f}s (rem {rem:.1f}s)")
         self.clone_counter.setText(f"clones this session: {sess}")
         self.clone_pending.setText(f"pending clips: {pend}")
+        self.clone_total.setText(f"total: {total_conv:.1f}s")
         # threshold spinbox: respect dirty state
         self._set_if_idle(self.clone_req, self.clone_req.setValue, req if req > 0 else self.clone_req.value())
         # identity text
@@ -945,7 +1397,8 @@ class MainWindow(QtWidgets.QMainWindow):
         now = time.monotonic()
         if now - getattr(self, "_last_clones", 0.0) > 3.0:
             clones = data.get("clones", [])
-            self.populate_clones(clones)
+            self._last_clones_items = list(clones)
+            self.populate_clones(self._last_clones_items)
             self._last_clones = now
 
         # presets table (throttled every ~5s)
@@ -953,6 +1406,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if now - getattr(self, "_last_presets", 0.0) > 5.0:
             self.refresh_presets()
             self._last_presets = now
+
+        # keys tab auto-refresh if visible (every ~5s)
+        try:
+            if self.tabs.currentWidget() is self.keys_tab:
+                if now - getattr(self, "_last_keys", 0.0) > 5.0:
+                    self.keys_refresh()
+                    self._last_keys = now
+        except Exception:
+            pass
 
 
     # ---- Presets helpers/actions ----

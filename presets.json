@@ -1,43 +1,6 @@
 {
   "presets": [
     {
-      "id": "p_1757605073848",
-      "name": "main",
-      "starred": false,
-      "created_at": 1757605073.848871,
-      "updated_at": 1757605073.848871,
-      "order": 1,
-      "data": {
-        "engine": "elevenlabs",
-        "audio_output": "default",
-        "streaming": true,
-        "playht": {
-          "speed": 1.0,
-          "style_guidance": 1.0,
-          "voice_guidance": 1.0,
-          "temperature": 1.5,
-          "text_guidance": 0.0,
-          "sample_rate": 24000
-        },
-        "elevenlabs": {
-          "use_speaker_boost": false,
-          "stability": 0.5,
-          "similarity_boost": 0.8,
-          "style": 0.1,
-          "speed": 1.0,
-          "model_id_stream": "eleven_flash_v2_5",
-          "format_stream": "mp3_22050_32",
-          "model_id_buffered": "eleven_multilingual_v2",
-          "format_buffered": "mp3_44100_128"
-        },
-        "vad": {
-          "mode": 2,
-          "initial_silence_timeout": 15.0,
-          "max_silence_length": 1.0
-        }
-      }
-    },
-    {
       "id": "p_1757617178305",
       "name": "test",
       "starred": false,

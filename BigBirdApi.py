@@ -4,6 +4,7 @@
 #------------------------------------------------------------------
 
 import os
+import glob
 import time
 import json
 import threading
@@ -15,7 +16,8 @@ import contextlib
 import webrtcvad
 import random
 import serial
-import whisper
+# Lazy-import heavy modules like Whisper (Torch) to reduce startup time
+whisper = None  # set when first needed
 from collections import deque
 from openai import OpenAI
 from pyht import Client, TTSOptions, Format
@@ -57,6 +59,7 @@ from dataclasses import dataclass, field
 from threading import RLock
 import subprocess
 import platform
+from pathlib import Path
 
 try:
     import psutil  # optional (CPU/mem)
@@ -76,6 +79,18 @@ except Exception:
 # Ensure .env values override any stale shell envs
 load_dotenv(override=True)
 
+# Helper to lazily import Whisper (Torch) when first needed
+def _load_whisper_module():
+    global whisper
+    if whisper is None:
+        try:
+            import whisper as _whisper
+            whisper = _whisper
+        except Exception as e:
+            logging.error(f"Failed to import whisper: {e}")
+            raise
+    return whisper
+
 # Ensure runtime directories exist
 def ensure_directories():
     for d in ["RecordedAudio", "RecordedAudio/New", "RecordedAudio/Old"]:
@@ -86,6 +101,41 @@ def ensure_directories():
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Admin control flags (for show director overrides) ---
+# Set via HTTP endpoints to steer the live flow from the GUI
+ADMIN_FORCE_VAD_END = threading.Event()       # end current VAD capture early
+ADMIN_ABORT_TTS = threading.Event()           # abort any current TTS playback/stream
+ADMIN_END_CONVERSATION = threading.Event()    # end the active conversation loop
+
+# Live VAD recording status for GUI
+RECORDING_ACTIVE = False
+RECORDING_STARTED_TS = 0.0
+
+def get_recording_status() -> dict:
+    try:
+        if RECORDING_ACTIVE:
+            return {"active": True, "elapsed": max(0.0, time.time() - RECORDING_STARTED_TS)}
+        return {"active": False, "elapsed": 0.0}
+    except Exception:
+        return {"active": False, "elapsed": 0.0}
+
+def admin_clear_transient_flags():
+    """Clear one-shot flags that should not persist across actions."""
+    ADMIN_FORCE_VAD_END.clear()
+    ADMIN_ABORT_TTS.clear()
+
+def should_abort_playback() -> bool:
+    """Return True if playback should be aborted due to admin override or on-hook."""
+    if ADMIN_ABORT_TTS.is_set() or ADMIN_END_CONVERSATION.is_set():
+        return True
+    try:
+        a = get_arduino()
+        if a and a.onHold():
+            return True
+    except Exception:
+        pass
+    return False
 # --- resilience knobs ---
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.getenv(name)
@@ -107,10 +157,10 @@ class PlayHTSettings:
 
 @dataclass
 class ElevenLabsSettings:
-    use_speaker_boost: bool = False
-    stability: float = 1
-    similarity_boost: float = 0.8
-    style: float = 0.1
+    use_speaker_boost: bool = True
+    stability: float = 0.5
+    similarity_boost: float = 1.0
+    style: float = 0.15
     speed: float = 1.0
     model_id_stream: str = "eleven_v3"
     format_stream: str = "mp3_22050_32"
@@ -133,7 +183,7 @@ class UIState:
     vad: VADSettings = field(default_factory=VADSettings)
     messages: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
     lock: RLock = field(default_factory=RLock)
-    gui_overrides: bool = True  # when False, GUI/preset changes won't override script-set values
+    gui_overrides: bool = False  # default to off so GUI doesn't override script on launch
 
     def set_gui_overrides(self, enabled: bool):
         with self.lock:
@@ -150,6 +200,7 @@ class UIState:
                 "vad": self.vad.__dict__,
                 "messages": list(self.messages),
                 "system": get_system_snapshot(),
+                "gui_overrides": self.gui_overrides,
             }
             try:
                 data["clones"] = voice_clone_manager.get_clone_info()
@@ -159,6 +210,14 @@ class UIState:
                 data["cloning"] = get_cloning_snapshot()
             except Exception:
                 data["cloning"] = {"error": "unavailable"}
+            try:
+                data["elevenlabs_keyring"] = get_eleven_keyring_status()
+            except Exception:
+                data["elevenlabs_keyring"] = {"active_alias": "—", "remaining_ivc": "—", "total_keys": 0}
+            try:
+                data["recording"] = get_recording_status()
+            except Exception:
+                data["recording"] = {"active": False, "elapsed": 0.0}
             return data
 
     def set_engine(self, e: str):
@@ -429,13 +488,196 @@ def get_system_snapshot():
         pass
     return snap
 
+def get_eleven_keyring_status() -> dict:
+    try:
+        data = ElevenKeyring.load()
+        ElevenKeyring.rollover_month_if_needed(data)
+        keys = data.get("keys", [])
+        active = ElevenKeyring.get_active_record(data)
+        alias = active.get("alias") if active else (data.get("last_active_alias") if keys else None)
+        remaining = None
+        if active:
+            try:
+                limit = int(active.get("ivc_monthly_limit", 0) or 0)
+                used = int(active.get("ivc_used_this_month", 0) or 0)
+                remaining = max(0, limit - used)
+            except Exception:
+                pass
+        return {
+            "active_alias": alias or "—",
+            "remaining_ivc": remaining if remaining is not None else "—",
+            "total_keys": len(keys),
+        }
+    except Exception:
+        return {"active_alias": "—", "remaining_ivc": "—", "total_keys": 0}
+
 # Constants
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_PROJECT = os.getenv('OPENAI_PROJECT')
 
-elevenlabs = ElevenLabs(
-  api_key=os.getenv("ELEVENLABS_API_KEY"),
-)
+class ElevenKeyring:
+    KEYRING_PATH = Path.home() / ".bigbird" / "eleven_keyring.json"
+
+    @classmethod
+    def _ensure(cls):
+        try:
+            cls.KEYRING_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if not cls.KEYRING_PATH.exists():
+                data = {"keys": [], "month_anchor": time.strftime("%Y-%m"), "last_active_alias": None}
+                cls.KEYRING_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def load(cls) -> dict:
+        cls._ensure()
+        try:
+            return json.loads(cls.KEYRING_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"keys": [], "month_anchor": time.strftime("%Y-%m"), "last_active_alias": None}
+
+    @classmethod
+    def save(cls, data: dict):
+        cls._ensure()
+        try:
+            cls.KEYRING_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def rollover_month_if_needed(cls, data: dict):
+        cur = time.strftime("%Y-%m")
+        if data.get("month_anchor") != cur:
+            for k in data.get("keys", []):
+                try:
+                    k["ivc_used_this_month"] = 0
+                except Exception:
+                    pass
+            data["month_anchor"] = cur
+
+    @classmethod
+    def get_active_record(cls, data: dict) -> Optional[dict]:
+        for k in data.get("keys", []):
+            if k.get("active"):
+                return k
+        return None
+
+    @classmethod
+    def set_active(cls, alias: str):
+        data = cls.load()
+        found = False
+        now = time.time()
+        for k in data.get("keys", []):
+            if k.get("alias") == alias:
+                k["active"] = True
+                k["last_used_ts"] = now
+                found = True
+            else:
+                k["active"] = False
+        if found:
+            data["last_active_alias"] = alias
+            cls.save(data)
+
+class ElevenClientManager:
+    def __init__(self):
+        self.client: Optional[ElevenLabs] = None
+        self._last_key: Optional[str] = None
+        self.refresh_client()
+
+    def _select_api_key(self) -> Optional[str]:
+        # Prefer active key from keyring; fallback to env var
+        data = ElevenKeyring.load()
+        ElevenKeyring.rollover_month_if_needed(data)
+        active = ElevenKeyring.get_active_record(data)
+        if active and active.get("api_key"):
+            return active.get("api_key")
+        return os.getenv("ELEVENLABS_API_KEY")
+
+    def refresh_client(self):
+        key = self._select_api_key()
+        try:
+            self.client = ElevenLabs(api_key=key)
+            self._last_key = key
+        except Exception as e:
+            logging.error(f"Failed to init ElevenLabs client: {e}")
+            self.client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+            self._last_key = os.getenv("ELEVENLABS_API_KEY")
+
+    def current_api_key(self) -> Optional[str]:
+        return self._select_api_key()
+
+    def ensure_fresh(self):
+        try:
+            cur = self._select_api_key()
+            if cur != self._last_key:
+                self.refresh_client()
+        except Exception:
+            pass
+
+    def _remaining_for(self, rec: dict) -> int:
+        try:
+            limit = int(rec.get("ivc_monthly_limit", 0) or 0)
+            used = int(rec.get("ivc_used_this_month", 0) or 0)
+            return max(0, limit - used)
+        except Exception:
+            return 0
+
+    def ivc_consumed(self, n: int = 1, rotate_threshold: int = 1):
+        """Increment active key's used count; rotate to another key if remaining <= threshold."""
+        data = ElevenKeyring.load()
+        ElevenKeyring.rollover_month_if_needed(data)
+        active = ElevenKeyring.get_active_record(data)
+        if not active:
+            ElevenKeyring.save(data)
+            return
+        try:
+            active["ivc_used_this_month"] = int(active.get("ivc_used_this_month", 0) or 0) + int(n)
+        except Exception:
+            active["ivc_used_this_month"] = int(n)
+        # Check remaining and rotate if needed
+        remaining = self._remaining_for(active)
+        if remaining <= rotate_threshold:
+            # pick another key with the most remaining
+            candidates = [k for k in data.get("keys", []) if k is not active]
+            candidates.sort(key=lambda r: self._remaining_for(r), reverse=True)
+            for rec in candidates:
+                if self._remaining_for(rec) > rotate_threshold and rec.get("api_key"):
+                    # switch to this alias
+                    alias = rec.get("alias")
+                    try:
+                        for k in data.get("keys", []):
+                            k["active"] = (k.get("alias") == alias)
+                            if k["active"]:
+                                k["last_used_ts"] = time.time()
+                        data["last_active_alias"] = alias
+                        ElevenKeyring.save(data)
+                        self.refresh_client()
+                        try:
+                            # Immediately refresh clone list for new key so selection uses fresh data
+                            voice_clone_manager.sync_with_api()
+                        except Exception:
+                            pass
+                        logging.info(f"Switched ElevenLabs key to alias '{alias}' due to low remaining IVC")
+                        # Optionally seed a carryover IVC clone using the last consolidated audio
+                        try:
+                            if _env_bool("CARRYOVER_IVC_ON_ROTATE", True):
+                                wav = _find_latest_consolidated_wav()
+                                if wav:
+                                    ts = time.strftime('%Y%m%d-%H%M%S')
+                                    def _do():
+                                        try:
+                                            ElevenLabsEngine().clone_from_file(wav, f"carryover_{ts}")
+                                        except Exception as _e:
+                                            logging.warning(f"Carryover IVC failed: {_e}")
+                                    threading.Thread(target=_do, daemon=True).start()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logging.error(f"Failed to rotate ElevenLabs key: {e}")
+                    break
+        ElevenKeyring.save(data)
+
+eleven_client_manager = ElevenClientManager()
 
 # Instantiate client explicitly with project to avoid defaulting to a project with no credit
 client = OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT) if OPENAI_PROJECT else OpenAI(api_key=OPENAI_API_KEY)
@@ -617,29 +859,39 @@ api_key_manager = APIKeyManager(PLAYHT_API_KEYS, PLAYHT_USER_IDS)
 
 class SessionAudioManager:
     def __init__(self):
-        self.clips = []
-        self.total_duration = 0.0  # Total duration in seconds
+        # Clips accumulated since the last clone threshold trigger
+        self.clips_since_last_clone = []
+        self.total_duration_since_last_clone = 0.0  # seconds since last clone
+        # All clips in the current conversation/session (growing until explicit reset)
+        self.all_clips = []
+        self.total_conversation_duration = 0.0  # total seconds for whole conversation
 
     def add_clip(self, file_path):
-        """Add a new audio clip and update total duration; mirror into global progress."""
         with contextlib.closing(wave.open(file_path, 'rb')) as wf:
             duration = wf.getnframes() / wf.getframerate()
-        self.clips.append(file_path)
-        self.total_duration += duration
+        # Append to per-clone batch and to full conversation
+        self.clips_since_last_clone.append(file_path)
+        self.total_duration_since_last_clone += duration
+        self.all_clips.append(file_path)
+        self.total_conversation_duration += duration
         # Mirror into global progress/pending for GUI
         try:
             clone_progress.note_collected(duration)
             clone_progress.add_pending_clip(file_path)
+            clone_progress.note_conversation(duration)
         except Exception:
             pass
 
     def should_send_for_cloning(self):
         """Check if the accumulated clips should be sent for voice cloning."""
-        return self.total_duration >= 7.5
+        return self.total_duration_since_last_clone >= 7.5
 
     def concatenate_clips(self):
-        """Concatenate all clips into a single WAV and return the path, or None if no clips."""
-        if not self.clips:
+        """Concatenate ALL clips in the current conversation into a single WAV and return the path.
+        Does NOT clear the conversation. It only resets the per-clone accumulation so the next
+        threshold counts fresh seconds, while the consolidated WAV keeps growing.
+        """
+        if not self.all_clips:
             logging.info("concatenate_clips: no clips to concatenate")
             return None
 
@@ -649,28 +901,42 @@ class SessionAudioManager:
         try:
             with wave.open(output_path, 'wb') as wf:
                 # Initialize parameters from the first clip
-                with wave.open(self.clips[0], 'rb') as cf:
+                with wave.open(self.all_clips[0], 'rb') as cf:
                     wf.setnchannels(cf.getnchannels())
                     wf.setsampwidth(cf.getsampwidth())
                     wf.setframerate(cf.getframerate())
 
-                for clip in self.clips:
-                    with wave.open(clip, 'rb') as cf:
-                        frames = cf.readframes(cf.getnframes())
-                        wf.writeframes(frames)
+                for clip in self.all_clips:
+                    try:
+                        with wave.open(clip, 'rb') as cf:
+                            frames = cf.readframes(cf.getnframes())
+                            wf.writeframes(frames)
+                    except Exception as e:
+                        logging.warning(f"Skipping bad clip {clip}: {e}")
         except Exception as e:
             logging.error(f"concatenate_clips failed: {e}")
             return None
         finally:
-            # Reset state whether success or failure
-            self.total_duration = 0.0
-            self.clips.clear()
+            # Reset only the per-clone counters so the next trigger is based on new speech
+            self.total_duration_since_last_clone = 0.0
+            self.clips_since_last_clone.clear()
             try:
-                clone_progress.reset_collected()  # reset progress (not clones_in_session)
+                clone_progress.reset_collected()  # reset GUI progress (not whole session)
             except Exception:
                 pass
 
         return output_path
+
+    def reset_conversation(self):
+        """Clear the entire conversation accumulation. Call this at end-of-call or on program shutdown."""
+        self.clips_since_last_clone.clear()
+        self.all_clips.clear()
+        self.total_duration_since_last_clone = 0.0
+        self.total_conversation_duration = 0.0
+        try:
+            clone_progress.reset_session()
+        except Exception:
+            pass
     
 # ---------------- Clone progress tracking (for GUI) ----------------
 class CloneProgressTracker:
@@ -681,6 +947,7 @@ class CloneProgressTracker:
         self.session_started_ts = time.time()
         self.lock = threading.Lock()
         self.pending_clip_paths: list[str] = []
+        self.conversation_seconds = 0.0
 
     def note_collected(self, seconds: float):
         with self.lock:
@@ -693,6 +960,13 @@ class CloneProgressTracker:
         with self.lock:
             if path and path not in self.pending_clip_paths:
                 self.pending_clip_paths.append(path)
+
+    def note_conversation(self, seconds: float):
+        with self.lock:
+            try:
+                self.conversation_seconds += max(0.0, float(seconds))
+            except Exception:
+                pass
 
     def reset_collected(self):
         """Reset progress toward next clone and clear pending list."""
@@ -750,6 +1024,7 @@ class CloneProgressTracker:
             self.collected_seconds = 0.0
             self.clones_in_session = 0
             self.pending_clip_paths.clear()
+            self.conversation_seconds = 0.0
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -764,6 +1039,7 @@ class CloneProgressTracker:
                 "clones_in_session": self.clones_in_session,
                 "pending_clips": len(self.pending_clip_paths),
                 "session_started": self.session_started_ts,
+                "conversation_seconds": self.conversation_seconds,
             }
 
 # Global tracker instance
@@ -771,8 +1047,16 @@ clone_progress = CloneProgressTracker(required_seconds=7.5)
 
 
 def read_saved_info(limit_chars: int = 1000) -> str:
-    """Return last up-to-`limit_chars` of savedInfo.txt if present."""
-    path = "savedInfo.txt"
+    """Return last up-to-`limit_chars` of savedInfo.txt if present.
+
+    Uses a stable path anchored at the project root so GUI/API processes
+    see the same file regardless of current working directory.
+    """
+    try:
+        base_dir = Path(__file__).resolve().parent.parent  # repo root
+    except Exception:
+        base_dir = Path('.')
+    path = base_dir / "savedInfo.txt"
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = f.read().strip()
@@ -804,6 +1088,7 @@ class AudioRecorderWithVAD:
 
     def record_with_vad(self, initial_silence_timeout=15, max_silence_length=1):
         """Record audio and stop when speech ends, with handling for initial silence and IO errors."""
+        global RECORDING_ACTIVE, RECORDING_STARTED_TS
         os.makedirs("RecordedAudio", exist_ok=True)
         stream = self.p.open(format=self.format, channels=self.channels, rate=self.rate, input=True, frames_per_buffer=self.frames_per_buffer)
         audio_frames = []
@@ -813,6 +1098,10 @@ class AudioRecorderWithVAD:
         try:
             # Wait for initial speech up to timeout
             for _ in range(initial_timeout_frames):
+                if ADMIN_FORCE_VAD_END.is_set() or ADMIN_END_CONVERSATION.is_set():
+                    # director cut: stop waiting and return no audio
+                    ADMIN_FORCE_VAD_END.clear()
+                    return None
                 try:
                     frame = stream.read(self.frames_per_buffer, exception_on_overflow=False)
                 except Exception as e:
@@ -820,6 +1109,9 @@ class AudioRecorderWithVAD:
                     continue
                 if self.is_speech(frame):
                     audio_frames.append(frame)
+                    # Mark start of active recording for GUI
+                    RECORDING_ACTIVE = True
+                    RECORDING_STARTED_TS = time.time()
                     break
                 else:
                     silent_frames.append(frame)
@@ -829,6 +1121,10 @@ class AudioRecorderWithVAD:
 
             # Continue recording until trailing silence reached
             while True:
+                if ADMIN_FORCE_VAD_END.is_set() or ADMIN_END_CONVERSATION.is_set():
+                    # director cut: end recording immediately
+                    ADMIN_FORCE_VAD_END.clear()
+                    break
                 try:
                     frame = stream.read(self.frames_per_buffer, exception_on_overflow=False)
                 except Exception as e:
@@ -847,6 +1143,8 @@ class AudioRecorderWithVAD:
         finally:
             stream.stop_stream()
             stream.close()
+            # Clear live-recording flag
+            RECORDING_ACTIVE = False
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         output_path = f"RecordedAudio/audio_{timestamp}.wav"
@@ -989,21 +1287,37 @@ class ArduinoControl:
         """led red blink"""
         command = "SETSTATE RECORDING"
         self.send_command(command)
+        try:
+            set_arduino_led_override("RECORDING")
+        except Exception:
+            pass
 
     def led_speaking(self):
         """led red blink"""
         command = "SETSTATE REPLYING"
         self.send_command(command)
+        try:
+            set_arduino_led_override("REPLYING")
+        except Exception:
+            pass
 
     def led_cloning(self):
         """led red blink"""
         command = "SETSTATE PROCESSING"
         self.send_command(command)
+        try:
+            set_arduino_led_override("PROCESSING")
+        except Exception:
+            pass
 
     def led_set_off(self):
         """led red blink"""
         command = "SETSTATE OFF"
         self.send_command(command)
+        try:
+            set_arduino_led_override("OFF")
+        except Exception:
+            pass
 
     def read_serial(self):
         """Read the serial input from Arduino."""
@@ -1078,14 +1392,10 @@ class AudioStreamer:
 
             header_buffer.extend(chunk)
 
-            # Abort if handset is ON-HOOK (hang up: stop playback)
-            try:
-                a = get_arduino()
-                if a and a.onHold():  # True == ON-HOOK in this codebase
-                    logging.info("On-hook detected – aborting live stream")
-                    break
-            except Exception:
-                pass
+            # Abort if handset is ON-HOOK or director override requests it
+            if should_abort_playback():
+                logging.info("Abort requested – stopping live stream")
+                break
 
             if not header_parsed and len(header_buffer) >= 44:
                 # Basic RIFF sanity‑check
@@ -1125,14 +1435,10 @@ class AudioStreamer:
 
                     if pcm_chunk:
                         self.stream.write(bytes(pcm_chunk))
-                        # Abort if handset is on-hook
-                        try:
-                            a = get_arduino()
-                            if a and a.onHold():  # True == ON-HOOK in this codebase
-                                logging.info("On-hook detected – aborting live stream")
-                                break
-                        except Exception:
-                            pass
+                        # Abort if handset is on-hook or override
+                        if should_abort_playback():
+                            logging.info("Abort requested – stopping live stream")
+                            break
                     continue  # header handled; wait for next pure‑PCM chunk
                 # else: keep buffering until 'data' shows up
                 continue
@@ -1158,14 +1464,10 @@ class AudioStreamer:
                         chunk = self._tail_byte + chunk
                         self._tail_byte = b""
                     if chunk:
-                        # Abort if handset is on-hook
-                        try:
-                            a = get_arduino()
-                            if a and a.onHold():  # True == ON-HOOK in this codebase
-                                logging.info("On-hook detected – aborting live stream")
-                                break
-                        except Exception:
-                            pass
+                        # Abort if handset is on-hook or override
+                        if should_abort_playback():
+                            logging.info("Abort requested – stopping live stream")
+                            break
                         self.stream.write(bytes(chunk))
 
         # end for
@@ -1177,6 +1479,8 @@ class AudioStreamer:
                 self.p.terminate()
         except Exception:
             pass
+        # Clear transient abort so next playback can proceed
+        ADMIN_ABORT_TTS.clear()
 
     def cleanup(self):
         """Cleanup the PyAudio stream and PyAudio instance."""
@@ -1236,13 +1540,9 @@ class AudioStreamerPair:
         header_parsed = False
 
         for chunk in out_stream:
-            try:
-                a = get_arduino()
-                if a and a.onHold():
-                    logging.info("On-hook detected – aborting PlayDialog stream")
-                    break
-            except Exception:
-                pass
+            if should_abort_playback():
+                logging.info("Abort requested – stopping PlayDialog stream")
+                break
             if not chunk:
                 continue
 
@@ -1278,6 +1578,10 @@ class AudioStreamerPair:
                     continue
 
             # Already parsed header → stream every chunk
+            # Abort if handset is ON-HOOK or director override
+            if should_abort_playback():
+                logging.info("Abort requested – stopping PlayDialog stream")
+                break
             self.stream.write(bytes(chunk))
 
     def cleanup(self):
@@ -1327,6 +1631,8 @@ class AudioStreamerPair:
         # 5. Wait until all audio has been played, then clean up.
         player.join()
         out_stream.close()
+        # Clear transient abort so next playback can proceed
+        ADMIN_ABORT_TTS.clear()
 
     def __del__(self):
         self.cleanup()
@@ -1386,13 +1692,9 @@ class AudioStreamerBuffered:
 
         data = wf.readframes(CHUNK)
         while data:
-            try:
-                a = get_arduino()
-                if a and a.onHold():
-                    logging.info("On-hook detected – stopping buffered playback")
-                    break
-            except Exception:
-                pass
+            if should_abort_playback():
+                logging.info("Abort requested – stopping buffered playback")
+                break
             stream.write(data)
             data = wf.readframes(CHUNK)
 
@@ -1409,6 +1711,8 @@ class AudioStreamerBuffered:
         """
         wav_file = self._download_tts(text, voice_url)
         self._play_wav(wav_file)
+        # Clear transient abort so next playback can proceed
+        ADMIN_ABORT_TTS.clear()
 
 class AudioStreamerBlackHole:
     def __init__(self, user_id, api_key):
@@ -1495,14 +1799,9 @@ class AudioStreamerBlackHole:
                         pcm_chunk = pcm_chunk[:-1]
 
                     if pcm_chunk:
-                        # Abort if handset is ON-HOOK (hang up: stop playback)
-                        try:
-                            a = get_arduino()
-                            if a and a.onHold():
-                                logging.info("On-hook detected – aborting BlackHole stream")
-                                return
-                        except Exception:
-                            pass
+                        if should_abort_playback():
+                            logging.info("Abort requested – stopping BlackHole stream")
+                            return
                         self.stream.write(bytes(pcm_chunk))
                     continue  # header handled
                 continue
@@ -1523,14 +1822,9 @@ class AudioStreamerBlackHole:
                         chunk = self._tail_byte + chunk
                         self._tail_byte = b""
                     if chunk:
-                        # Abort if handset is ON-HOOK (hang up: stop playback)
-                        try:
-                            a = get_arduino()
-                            if a and a.onHold():
-                                logging.info("On-hook detected – aborting BlackHole stream")
-                                return
-                        except Exception:
-                            pass
+                        if should_abort_playback():
+                            logging.info("Abort requested – stopping BlackHole stream")
+                            return
                         self.stream.write(bytes(chunk))
 
 
@@ -1635,18 +1929,35 @@ class ElevenLabsEngine(TTSEngine):
         Uses most-recent ElevenLabs clone if available, else ELEVENLABS_VOICE_ID.
         """
         try:
-            # 1) Choose voice
+            # 1) Choose a voice that exists for the CURRENT key
             recent_id = voice_clone_manager.get_recent_clone_id(engine="elevenlabs")
             env_id = os.getenv("ELEVENLABS_VOICE_ID")
-            voice_id = recent_id or env_id
+            voice_id = None
+            source = None
+            eleven_client_manager.ensure_fresh()
+            for cand, src in ((recent_id, "recent"), (env_id, "env")):
+                if cand and eleven_voice_exists(cand):
+                    voice_id = cand
+                    source = src
+                    break
             if not voice_id:
-                logging.warning("ElevenLabsEngine.stream_text: no ELEVENLABS voice available (no recent clone and no ELEVENLABS_VOICE_ID); skipping playback")
+                # fall back to the most recent user-owned/deletable voice
+                voices = fetch_elevenlabs_voices()
+                if voices:
+                    try:
+                        voices.sort(key=lambda v: v.get('created_at') or 0)
+                    except Exception:
+                        pass
+                    voice_id = voices[-1]["id"]
+                    source = "list"
+            if not voice_id:
+                logging.warning("ElevenLabsEngine.stream_text: no accessible ElevenLabs voice for current key; skipping playback")
                 return
-            logging.info(f"ElevenLabsEngine.stream_text (streaming) using voice_id={voice_id} (source={'recent' if recent_id else 'env'})")
+            logging.info(f"ElevenLabsEngine.stream_text (streaming) using voice_id={voice_id} (source={source})")
 
             # 2) Low-latency model & compact format for streaming; override via env if desired
             els = ui_state.elevenlabs
-            model_id = els.model_id_stream or os.getenv("ELEVENLABS_TTS_MODEL_STREAM", os.getenv("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"))
+            model_id = els.model_id_stream or os.getenv("ELEVENLABS_TTS_MODEL_STREAM", os.getenv("ELEVENLABS_TTS_MODEL", "eleven_v3"))
             output_format = els.format_stream or os.getenv("ELEVENLABS_TTS_FORMAT_STREAM", "mp3_22050_32")
 
             settings = {
@@ -1660,7 +1971,8 @@ class ElevenLabsEngine(TTSEngine):
 
             # 4) STREAMING PATH
             try:
-                audio_stream = elevenlabs.text_to_speech.stream(
+                eleven_client_manager.ensure_fresh()
+                audio_stream = eleven_client_manager.client.text_to_speech.stream(
                     text=text,
                     voice_id=voice_id,
                     model_id=model_id,
@@ -1687,9 +1999,10 @@ class ElevenLabsEngine(TTSEngine):
                 logging.warning(f"ElevenLabsEngine.stream_text: streaming failed ({se}); falling back to buffered convert")
 
             # 5) BUFFERED FALLBACK (previous behaviour)
-            model_id_fb = els.model_id_buffered or "eleven_multilingual_v2"
+            model_id_fb = els.model_id_buffered or "eleven_v3"
             output_format_fb = els.format_buffered or "mp3_44100_128"
-            audio = elevenlabs.text_to_speech.convert(
+            eleven_client_manager.ensure_fresh()
+            audio = eleven_client_manager.client.text_to_speech.convert(
                 text=text,
                 voice_id=voice_id,
                 model_id=model_id_fb,
@@ -1735,7 +2048,7 @@ class ElevenLabsEngine(TTSEngine):
         try:
             with open(file_path, "rb") as f:
                 data = f.read()
-            voice = elevenlabs.voices.ivc.create(
+            voice = eleven_client_manager.client.voices.ivc.create(
                 name=voice_name,
                 files=[BytesIO(data)],
             )
@@ -1745,6 +2058,10 @@ class ElevenLabsEngine(TTSEngine):
                 return None
 
             voice_clone_manager.add_new_clone(voice_name, voice_id, engine="elevenlabs")
+            try:
+                eleven_client_manager.ivc_consumed(1)
+            except Exception:
+                pass
             logging.info(f"ElevenLabs clone created: {voice_name} -> {voice_id}")
             return voice_id
         except Exception as e:
@@ -1758,9 +2075,6 @@ def get_tts_engine() -> TTSEngine:
         return ElevenLabsEngine()
     logging.info("TTS engine: PlayHT (live)")
     return PlayHTEngine()
-
-# Global engine instance and convenience helpers
-_tts_engine: TTSEngine = get_tts_engine()
 
 def tts_speak(text: str):
     try:
@@ -1783,7 +2097,12 @@ def tts_clone_from_session(session_manager: 'SessionAudioManager', threaded: boo
 
     def _do_clone():
         ts = time.strftime('%Y%m%d-%H%M%S')
-        _tts_engine.clone_from_file(concatenated_path, f'session_clone{ts}')
+        # Use current engine at execution time (not a module-level singleton)
+        try:
+            eng = get_tts_engine()
+            eng.clone_from_file(concatenated_path, f'session_clone{ts}')
+        except Exception as e:
+            logging.error(f"tts_clone_from_session failed: {e}")
 
     if threaded:
         th = threading.Thread(target=_do_clone, daemon=True)
@@ -1792,6 +2111,67 @@ def tts_clone_from_session(session_manager: 'SessionAudioManager', threaded: boo
     else:
         _do_clone()
         return None
+
+
+def _find_latest_consolidated_wav() -> Optional[str]:
+    """Return the most recent consolidated WAV from RecordedAudio or None.
+    Looks for files produced by concatenation helpers, e.g.:
+    - RecordedAudio/concatenated_audio_*.wav
+    - RecordedAudio/concatenated_pending_*.wav
+    """
+    try:
+        candidates = []
+        for pattern in (
+            os.path.join("RecordedAudio", "concatenated_audio_*.wav"),
+            os.path.join("RecordedAudio", "concatenated_pending_*.wav"),
+        ):
+            candidates.extend(glob.glob(pattern))
+        if not candidates:
+            return None
+        latest = max(candidates, key=lambda p: os.path.getmtime(p))
+        return latest
+    except Exception as e:
+        logging.warning(f"Failed to scan for consolidated WAVs: {e}")
+        return None
+
+
+def startup_clone_from_recent_consolidated():
+    """If a consolidated WAV exists, create a clone at startup using the selected engine.
+    This seeds the session with a usable voice (PlayHT or ElevenLabs).
+    """
+    path = _find_latest_consolidated_wav()
+    if not path:
+        logging.info("No consolidated WAV found at startup; skipping initial clone")
+        return
+
+    try:
+        # Ensure current clone cache is loaded
+        try:
+            voice_clone_manager.sync_state()
+        except Exception:
+            pass
+
+        engine = (ui_state.engine or 'playht').strip().lower()
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        name = f"startup_clone{ts}"
+
+        if engine == 'elevenlabs':
+            logging.info(f"Startup cloning (ElevenLabs) from {os.path.basename(path)}")
+            el = ElevenLabsEngine()
+            vid = el.clone_from_file(path, name)
+            if vid:
+                logging.info(f"Startup ElevenLabs clone ready: {name} -> {vid}")
+            else:
+                logging.warning("Startup ElevenLabs clone failed; TTS may fallback or use previous clones")
+        else:
+            logging.info(f"Startup cloning (PlayHT) from {os.path.basename(path)}")
+            try:
+                VoiceCloning.send_audio_for_cloning(fileLocation=path, voiceName=name)
+                logging.info("Startup PlayHT clone queued/created")
+            except Exception as e:
+                logging.warning(f"Startup PlayHT clone failed: {e}")
+    except Exception as e:
+        logging.warning(f"startup_clone_from_recent_consolidated encountered an error: {e}")
 
 
 
@@ -1843,16 +2223,30 @@ class VoiceCloning:
             logging.error(f"send_audio_for_cloning unexpected error: {e}")
 
 class VoiceCloneManager:
-    def __init__(self, capacity_playht: int = 8, capacity_elevenlabs: int = 4, storage_file: str = 'voice_clones.json'):
+    def __init__(self, capacity_playht: int = 8, capacity_elevenlabs: int = 4, storage_file: Optional[str] = None):
         # Unbounded; we enforce caps ourselves
         self.clones = deque()
         self.capacity_map = {
             'playht': int(capacity_playht),
             'elevenlabs': int(capacity_elevenlabs),
         }
+        # Use a consistent file path at project root so GUI launches (cwd=BigBird)
+        # and direct runs (cwd=repo) share the same state file.
+        if not storage_file:
+            project_root = Path(__file__).resolve().parent.parent
+            storage_file = str(project_root / 'voice_clones.json')
         self.storage_file = storage_file
+        self.tombstoned_ids = set()
         self.load_clones()
-        self.sync_with_api()
+        # Avoid blocking startup on network I/O; sync in background unless explicitly requested
+        if _env_bool("SYNC_CLONES_ON_STARTUP", False):
+            self.sync_with_api()
+        else:
+            try:
+                threading.Thread(target=self.sync_with_api, daemon=True).start()
+            except Exception:
+                # Non-fatal; will sync later when needed
+                pass
 
     def sync_with_api(self):
         # PlayHT
@@ -1878,8 +2272,18 @@ class VoiceCloneManager:
             el = fetch_elevenlabs_voices()
         except Exception as e:
             logging.warning(f"ElevenLabs sync failed: {e}")
-            el = []
-        for v in el:
+            el = None
+        live_el_ids = {v.get("id") for v in (el or []) if v.get("id")}
+        # Purge only when we fetched successfully; if el is None, keep existing local entries
+        if el is not None:
+            try:
+                self.clones = deque([
+                    c for c in self.clones
+                    if not (c.get('engine') == 'elevenlabs' and c.get('id') and c.get('id') not in live_el_ids)
+                ])
+            except Exception:
+                pass
+        for v in (el or []):
             norm = {
                 "name": v.get("name"),
                 "id": v.get("id"),
@@ -1889,6 +2293,14 @@ class VoiceCloneManager:
                 "is_owner": v.get("is_owner"),
                 "permission": v.get("permission"),
             }
+            # Tag with the active alias for this sync
+            try:
+                data = ElevenKeyring.load()
+                active = ElevenKeyring.get_active_record(data)
+                alias = active.get("alias") if active else (data.get("last_active_alias") if data.get("keys") else None)
+                norm["account_alias"] = alias
+            except Exception:
+                pass
             if not any(c.get("id") == norm["id"] for c in self.clones):
                 self.clones.append(norm)
 
@@ -1901,8 +2313,19 @@ class VoiceCloneManager:
         return sum(1 for c in self.clones if c.get('engine','playht') == engine)
 
     def _enforce_capacity(self, engine: str):
+        # Do not auto-delete remote ElevenLabs voices; only manage PlayHT capacity locally
+        if engine == 'elevenlabs':
+            return
         cap = self.capacity_map.get(engine, 999999)
         while self._count_engine(engine) > cap:
+            # Choose the oldest that is not tombstoned
+            candidates = [
+                c for c in self.clones
+                if c.get('engine','playht') == engine and c.get('id') not in self.tombstoned_ids
+            ]
+            if not candidates:
+                break
+            oldest = min(candidates, key=lambda c: c.get('created_at', 0))
             self.delete_oldest_clone(engine=engine)
 
     def _dedupe_in_place(self):
@@ -1923,7 +2346,18 @@ class VoiceCloneManager:
         self.clones = deque([c for c in self.clones if not (c.get('engine', 'playht') == engine and c.get('id') == voice_id)])
         meta = {"name": voice_name, "id": voice_id, "engine": engine, "created_at": ts}
         if engine == "elevenlabs":
-            meta.update({"category": "cloned", "is_owner": True})
+            # Tag with the active ElevenLabs alias at creation time
+            try:
+                data = ElevenKeyring.load()
+                active = ElevenKeyring.get_active_record(data)
+                alias = active.get("alias") if active else (data.get("last_active_alias") if data.get("keys") else None)
+            except Exception:
+                alias = None
+            meta.update({
+                "category": "cloned",
+                "is_owner": True,
+                "account_alias": alias,
+            })
         self.clones.append(meta)
         self._dedupe_in_place()
         self._enforce_capacity(engine)
@@ -1973,7 +2407,7 @@ class VoiceCloneManager:
         if not vid:
             logging.error("delete_oldest_clone: candidate missing id (engine=%s): %r", eng, oldest)
             return
-        ok = delete_clone_by_id(vid, engine=eng)
+        ok, reason = delete_clone_by_id(vid, engine=eng)
         if ok:
             try:
                 self.clones.remove(oldest)
@@ -1981,7 +2415,17 @@ class VoiceCloneManager:
             except ValueError:
                 pass
         else:
-            logging.warning("delete_oldest_clone: remote delete failed for id=%s engine=%s; keeping local entry", vid, eng)
+            if reason == 'not_exist':
+                # Remote confirms it doesn't exist — drop local entry to stop spikes
+                try:
+                    self.tombstoned_ids.add(vid)
+                    self.clones.remove(oldest)
+                    self.save_clones()
+                    logging.info("Pruned stale local clone id=%s engine=%s (not_exist)", vid, eng)
+                except ValueError:
+                    pass
+            else:
+                logging.warning("delete_oldest_clone: remote delete failed for id=%s engine=%s; keeping local entry", vid, eng)
         
     def save_clones(self):
         try:
@@ -1992,6 +2436,22 @@ class VoiceCloneManager:
 
     def get_recent_clone_id(self, index: int = 1, engine: str = 'playht') -> Optional[str]:
         filtered = [c for c in self.clones if c.get('engine', 'playht') == engine]
+        if engine == 'elevenlabs':
+            # Prefer clones matching the active alias
+            try:
+                data = ElevenKeyring.load()
+                active = ElevenKeyring.get_active_record(data)
+                alias = active.get("alias") if active else (data.get("last_active_alias") if data.get("keys") else None)
+            except Exception:
+                alias = None
+            if alias:
+                filtered_by_alias = [c for c in filtered if c.get('account_alias') == alias]
+                # Sort by created_at to ensure newest last
+                filtered_by_alias.sort(key=lambda c: c.get('created_at') or 0)
+                if len(filtered_by_alias) >= index:
+                    return filtered_by_alias[-index]['id']
+        # Fallback: sort all by created_at
+        filtered.sort(key=lambda c: c.get('created_at') or 0)
         if len(filtered) >= index:
             return filtered[-index]['id']
         return None
@@ -1999,6 +2459,7 @@ class VoiceCloneManager:
     def get_recent_clone_url(self, index: int = 1, engine: str = 'playht') -> Optional[str]:
         # For PlayHT, the "url" we store is the id used by their API
         filtered = [c for c in self.clones if c.get('engine', 'playht') == engine]
+        filtered.sort(key=lambda c: c.get('created_at') or 0)
         if len(filtered) >= index:
             return filtered[-index]['id']
         return None
@@ -2054,24 +2515,22 @@ class VoiceCloneManager:
                 "created_at": c.get("created_at"),
                 "category": c.get("category"),
                 "is_owner": c.get("is_owner"),
+                "account_alias": c.get("account_alias"),
                 "deletable": _is_deletable(c),
             }
             for c in list(self.clones)
         ]
 
-def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
+def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> tuple[bool, str]:
     """
-    Delete a remote cloned voice by id for the given engine.
-    Returns True on success, False otherwise.
-    
-    Fixes the 400 error you saw by ensuring the PlayHT DELETE endpoint
-    includes the voice_id:  /api/v2/cloned-voices/{voice_id}
-    and by adding clear diagnostics with status code and response text.
+    Attempt to delete a cloned voice remotely.
+    Returns (ok, reason) where ok is True on successful remote delete, and
+    reason is one of: 'ok', 'not_exist', 'error'.
     """
     try:
         if not voice_id:
             logging.error("delete_clone_by_id: missing voice_id (engine=%s)", engine)
-            return False
+            return False, 'error'
 
         # ---------------- PLAYHT ----------------
         if engine.lower() == 'playht':
@@ -2086,7 +2545,7 @@ def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
                 resp = requests.delete(url_playht, headers=headers, timeout=15)
                 if 200 <= resp.status_code < 300:
                     logging.info("Deleted PlayHT clone %s", voice_id)
-                    return True
+                    return True, 'ok'
 
                 # Rate limit → cool down and retry once
                 if resp.status_code == 429:
@@ -2095,7 +2554,7 @@ def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
                     resp2 = requests.delete(url_playht, headers=headers, timeout=15)
                     if 200 <= resp2.status_code < 300:
                         logging.info("Deleted PlayHT clone %s on retry", voice_id)
-                        return True
+                        return True, 'ok'
                     # If still not good, continue with fallbacks using latest response
                     resp = resp2
 
@@ -2110,7 +2569,7 @@ def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
                         resp_b = requests.delete(url_coll, headers=headers_json, json=payload, timeout=15)
                         if 200 <= resp_b.status_code < 300:
                             logging.info("Deleted PlayHT clone %s via body-based endpoint", voice_id)
-                            return True
+                            return True, 'ok'
                     except requests.exceptions.RequestException as re2:
                         logging.warning("Body-based delete request error for %s: %s", voice_id, re2)
 
@@ -2143,7 +2602,7 @@ def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
                                             c['id'] = canon
                                 except Exception:
                                     pass
-                                return True
+                                return True, 'ok'
                             logging.error("Canonical delete failed for hint %s → %s: %s %s — %s",
                                           voice_id, canon, resp_canon.status_code, resp_canon.reason, (resp_canon.text or '').strip()[:200])
                     except requests.exceptions.RequestException as re3:
@@ -2153,40 +2612,43 @@ def delete_clone_by_id(voice_id: str, engine: str = 'playht') -> bool:
 
                 # Final log for other failures
                 logging.error("Error deleting PlayHT clone %s: %s %s — %s", voice_id, resp.status_code, resp.reason, (resp.text or '').strip()[:300])
-                return False
+                return False, 'error'
 
             except requests.exceptions.RequestException as re:
                 status = getattr(getattr(re, 'response', None), 'status_code', None)
                 body = getattr(getattr(re, 'response', None), 'text', '')
                 logging.error("delete_clone_by_id PlayHT request error (id=%s): %s (status=%s) %s", voice_id, re, status, (body or '').strip()[:300])
-                return False
+                return False, 'error'
 
         # ---------------- ELEVENLABS ----------------
         elif engine.lower() == 'elevenlabs':
             try:
-                # Prefer SDK delete if available; fall back to REST if needed
-                if hasattr(elevenlabs.voices, 'delete') and callable(elevenlabs.voices.delete):
-                    elevenlabs.voices.delete(voice_id)
-                else:
-                    url_el = f"https://api.elevenlabs.io/v1/voices/{urllib.parse.quote(str(voice_id))}"
-                    _headers = {"xi-api-key": os.getenv("ELEVENLABS_API_KEY")}
-                    r = requests.delete(url_el, headers=_headers, timeout=15)
-                    if not (200 <= r.status_code < 300):
-                        logging.error("Error deleting ElevenLabs voice %s: %s %s — %s", voice_id, r.status_code, r.reason, (r.text or '').strip()[:300])
-                        return False
+                # ElevenLabs SDK: success typically raises no exception
+                eleven_client_manager.client.voices.delete(voice_id)
                 logging.info("Deleted ElevenLabs voice %s", voice_id)
-                return True
+                return True, 'ok'
             except Exception as e:
-                logging.error("delete_clone_by_id ElevenLabs error (id=%s): %s", voice_id, e)
-                return False
+                msg = getattr(e, 'message', None) or str(e)
+                try:
+                    body = getattr(getattr(e, 'response', None), 'json', lambda: {})()
+                except Exception:
+                    body = {}
+                status = None
+                if isinstance(body, dict):
+                    detail = body.get('detail') or {}
+                    status = detail.get('status')
+                if status == 'voice_does_not_exist' or 'voice_does_not_exist' in msg:
+                    return False, 'not_exist'
+                logging.error("delete_clone_by_id ElevenLabs error (id=%s): %s", voice_id, msg)
+                return False, 'error'
 
         else:
             logging.warning("delete_clone_by_id: unknown engine '%s' for id=%s", engine, voice_id)
-            return False
+            return False, 'error'
 
     except Exception as e:
         logging.error("delete_clone_by_id unexpected error (id=%s, engine=%s): %s", voice_id, engine, e)
-        return False
+        return False, 'error'
 
 def fetch_cloned_voices():
     url = "https://api.play.ht/api/v2/cloned-voices"
@@ -2216,10 +2678,10 @@ def fetch_cloned_voices():
         return []
 
 def fetch_elevenlabs_voices():
-    api_key = os.getenv("ELEVENLABS_API_KEY")
+    api_key = eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         logging.warning("ELEVENLABS_API_KEY not set; cannot list ElevenLabs voices")
-        return []
+        return None
     url = "https://api.elevenlabs.io/v1/voices"
     headers = {"xi-api-key": api_key, "accept": "application/json"}
     try:
@@ -2247,14 +2709,66 @@ def fetch_elevenlabs_voices():
         return out
     except requests.exceptions.Timeout:
         logging.error("ElevenLabs voices request timed out")
-        return []
+        return None
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to fetch ElevenLabs voices: {e}")
-        return []
+        return None
+
+def fetch_elevenlabs_voices_with_key(api_key: str):
+    """Fetch ElevenLabs voices using a specific API key. Returns list or None on error."""
+    if not api_key:
+        return None
+    url = "https://api.elevenlabs.io/v1/voices"
+    headers = {"xi-api-key": api_key, "accept": "application/json"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        out = []
+        for v in data.get("voices", []):
+            cat = (v.get("category") or "").lower()
+            if cat and cat not in ("cloned", "generated"):
+                continue
+            vid = v.get("voice_id") or v.get("id")
+            name = v.get("name") or v.get("display_name") or vid
+            if not vid:
+                continue
+            out.append({
+                "id": vid,
+                "name": name,
+                "category": cat or None,
+                "is_owner": bool(v.get("is_owner")),
+                "permission": v.get("permission_on_resource") or v.get("permission"),
+                "created_at": v.get("created_at_unix") or time.time(),
+            })
+        return out
+    except requests.exceptions.Timeout:
+        logging.error("ElevenLabs voices request timed out (alias-specific)")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to fetch ElevenLabs voices (alias-specific): {e}")
+        return None
+
+def eleven_voice_exists(voice_id: str) -> bool:
+    """Return True if the current ElevenLabs key can see `voice_id`."""
+    if not voice_id:
+        return False
+    api_key = eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        return False
+    url = f"https://api.elevenlabs.io/v1/voices/{voice_id}"
+    headers = {"xi-api-key": api_key, "accept": "application/json"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.status_code == 200:
+            return True
+        return False
+    except requests.exceptions.RequestException:
+        return False
 
 def delete_elevenlabs_voice(voice_id: str) -> bool:
     """Delete an ElevenLabs voice via REST; treat 'voice_does_not_exist' as success; optional SDK fallback."""
-    api_key = os.getenv("ELEVENLABS_API_KEY")
+    api_key = eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY")
     if not api_key:
         logging.error("ELEVENLABS_API_KEY not set; cannot delete ElevenLabs voice")
         return False
@@ -2749,7 +3263,8 @@ def test_full_interaction_cycle():
     openai_handler = OpenAIHandler()
     localAI = localAiHandler()
     session = ChatSession(system_message=GptTrainingText[2])
-    model = whisper.load_model("base.en")
+    # Lazy-load Whisper only when local transcription is actually used
+    model = _load_whisper_module().load_model("base.en")
     log = FileManager("savedChats.txt")
     dataLog = FileManager("savedInfo.txt")
     streamer = AudioStreamer()
@@ -2802,6 +3317,10 @@ def test_full_interaction_cycle():
 
     try:
         while loop:
+
+            # Director can end conversation at any time
+            if ADMIN_END_CONVERSATION.is_set():
+                break
         
             # Step 1: Record audio with voice activity detection
             arduino.led_recording()
@@ -2814,7 +3333,7 @@ def test_full_interaction_cycle():
 
 
 
-            if arduino.onHold():
+            if arduino.onHold() or ADMIN_END_CONVERSATION.is_set():
                 break
 
             #Check if any audio is returned
@@ -2840,13 +3359,13 @@ def test_full_interaction_cycle():
                 if aiThread:
                     threads.append(aiThread)
             
-            if arduino.onHold():
+            if arduino.onHold() or ADMIN_END_CONVERSATION.is_set():
                 break
             
             arduino.led_cloning()
-            #transcription = localAI.whisper_audio(audio_path, model)
+            transcription = localAI.whisper_audio(audio_path, model)
 
-            transcription = openai_handler.transcribe_audio(audio_path=audio_path)
+            #transcription = openai_handler.transcribe_audio(audio_path=audio_path)
             ui_state.append_message("user", transcription or "")
             print('you said ', transcription)
             if 'exit' in transcription.lower():
@@ -2856,7 +3375,7 @@ def test_full_interaction_cycle():
                 poem_cycle()
                 break
 
-            if arduino.onHold():
+            if arduino.onHold() or ADMIN_END_CONVERSATION.is_set():
                 break
 
             session.add_user_message(transcription)
@@ -2883,6 +3402,8 @@ def test_full_interaction_cycle():
         print(e)
         
     finally:
+        # Clear director end flag for next run
+        ADMIN_END_CONVERSATION.clear()
         word_cycle()
         dataLog.clear_file()
         arduino.led_set_off()
@@ -2905,7 +3426,15 @@ def test_full_interaction_cycle():
 
 class FileManager:
     def __init__(self, filename):
-        self.filename = filename
+        # Anchor relative filenames at the project root so all processes agree
+        try:
+            base_dir = Path(__file__).resolve().parent.parent
+        except Exception:
+            base_dir = Path('.')
+        if not os.path.isabs(filename):
+            self.filename = str(base_dir / filename)
+        else:
+            self.filename = filename
 
     def write_text(self, text):
         """Write text to the file."""
@@ -3065,6 +3594,15 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
     def get_state():
         return ui_state.to_dict()
 
+    @app.post("/state/gui_overrides")
+    def set_gui_overrides(payload: dict):
+        try:
+            enabled = bool(payload.get("enabled", False))
+            ui_state.set_gui_overrides(enabled)
+            return {"ok": True, "gui_overrides": ui_state.gui_overrides}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     @app.get("/clones")
     def get_clones():
         return voice_clone_manager.get_clone_info()
@@ -3103,6 +3641,31 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
         ui_state.append_message("assistant", txt)
         threading.Thread(target=tts_speak, args=(txt,), daemon=True).start()
         return {"ok": True}
+
+    # ---- Director overrides ----
+    @app.post("/control/vad/force-end")
+    def control_vad_force_end():
+        try:
+            ADMIN_FORCE_VAD_END.set()
+            return {"ok": True, "forced": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/control/abort-tts")
+    def control_abort_tts():
+        try:
+            ADMIN_ABORT_TTS.set()
+            return {"ok": True, "aborted": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/control/conversation/end")
+    def control_end_conversation():
+        try:
+            ADMIN_END_CONVERSATION.set()
+            return {"ok": True, "ended": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     @app.get("/arduino/state")
     def arduino_state():
@@ -3165,15 +3728,20 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
                 if c.get("id") == voice_id:
                     engine = c.get("engine", None)
                     break
-            ok = delete_clone_by_id(voice_id, engine=engine)
-            if ok:
+            ok, reason = delete_clone_by_id(voice_id, engine=engine)
+            if ok or reason == 'not_exist':
                 # purge locally and resync
                 try:
                     voice_clone_manager.clones = deque([c for c in voice_clone_manager.clones if c.get("id") != voice_id])
                     voice_clone_manager.save_clones()
                 except Exception:
                     pass
-            return {"ok": ok, "engine": engine}
+                if reason == 'not_exist':
+                    try:
+                        voice_clone_manager.tombstoned_ids.add(voice_id)
+                    except Exception:
+                        pass
+            return {"ok": ok or reason == 'not_exist', "engine": engine, "reason": reason}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
@@ -3191,6 +3759,54 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
         try:
             voice_clone_manager.sync_with_api()
             return {"ok": True, "count": len(voice_clone_manager.clones)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/clones/sync-all")
+    def clones_sync_all():
+        """Aggregate ElevenLabs voices for all aliases in keyring; do not purge existing entries."""
+        try:
+            data = ElevenKeyring.load()
+            keys = data.get("keys", [])
+            aliases = [k.get("alias") for k in keys if k.get("api_key")]
+            if not aliases:
+                return {"ok": True, "count": len(voice_clone_manager.clones), "aliases": []}
+            added = 0
+            seen_ids = set()
+            # Build a quick lookup of existing EL ids to avoid duplicates
+            try:
+                for c in list(voice_clone_manager.clones):
+                    if c.get("engine") == "elevenlabs" and c.get("id"):
+                        seen_ids.add(c.get("id"))
+            except Exception:
+                pass
+            for rec in keys:
+                alias = rec.get("alias")
+                api_key = rec.get("api_key")
+                if not api_key or not alias:
+                    continue
+                voices = fetch_elevenlabs_voices_with_key(api_key) or []
+                for v in voices:
+                    vid = v.get("id")
+                    if not vid or vid in seen_ids:
+                        continue
+                    norm = {
+                        "name": v.get("name") or vid,
+                        "id": vid,
+                        "engine": "elevenlabs",
+                        "created_at": v.get("created_at") or time.time(),
+                        "category": v.get("category"),
+                        "is_owner": v.get("is_owner"),
+                        "permission": v.get("permission"),
+                        "account_alias": alias,
+                    }
+                    voice_clone_manager.clones.append(norm)
+                    seen_ids.add(vid)
+                    added += 1
+            # Dedupe once
+            voice_clone_manager._dedupe_in_place()
+            voice_clone_manager.save_clones()
+            return {"ok": True, "added": added, "count": len(voice_clone_manager.clones), "aliases": aliases}
         except Exception as e:
             return {"ok": False, "error": str(e)}
         
@@ -3356,7 +3972,15 @@ We ignore the decay, our basket of eggs turned to dust.
             
 
 if __name__ == "__main__":
-    start_control_server()
+    # Optional: disable control server for faster/lighter startup
+    if not _env_bool("DISABLE_CONTROL_SERVER", False):
+        start_control_server()
+    # Optionally seed a voice clone from the most recent consolidated audio
+    if _env_bool("SEED_CLONE_ON_STARTUP", False):
+        try:
+            threading.Thread(target=startup_clone_from_recent_consolidated, daemon=True).start()
+        except Exception as _e:
+            logging.warning(f"Startup clone seeding skipped due to error: {_e}")
     #filmPrint()
     while(True):
 
