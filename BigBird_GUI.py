@@ -182,13 +182,7 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.output)
         self.apply_audio_btn = QtWidgets.QPushButton("Apply Audio")
         top.addWidget(self.apply_audio_btn)
-        # Audio debug info: requested vs device rate
-        self.audio_info = QtWidgets.QLabel("Audio: —")
-        self.audio_info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        top.addWidget(self.audio_info)
-        # Test tone button
-        self.test_tone_btn = QtWidgets.QPushButton("Test Tone (1 kHz @ 44.1k)")
-        top.addWidget(self.test_tone_btn)
+        # (Test tone moved into Director Controls box below)
 
         # GUI overrides toggle — when off, backend ignores GUI/preset changes
         self.override_chk = QtWidgets.QCheckBox("Overwrite script settings")
@@ -361,15 +355,16 @@ class MainWindow(QtWidgets.QMainWindow):
         led_row.addWidget(self.led_clear_btn)
         aform.addRow(led_row)
 
-        # Ring controls
+        # Ring controls (double buzz only)
         ring_row = QtWidgets.QHBoxLayout()
         ring_row.addWidget(QtWidgets.QLabel("Ring:"))
-        self.ring_single_btn = QtWidgets.QPushButton("Single")
-        self.ring_single_btn.clicked.connect(lambda: self.on_ring("single"))
-        ring_row.addWidget(self.ring_single_btn)
-        self.ring_double_btn = QtWidgets.QPushButton("Double")
+        self.ring_double_btn = QtWidgets.QPushButton("Double Buzz")
         self.ring_double_btn.clicked.connect(lambda: self.on_ring("double"))
         ring_row.addWidget(self.ring_double_btn)
+        # Test tone button placed next to Double Buzz
+        self.test_tone_btn = QtWidgets.QPushButton("Test Tone (1 kHz @ 44.1k)")
+        self.test_tone_btn.setToolTip("Play a 1 kHz sine to verify audio routing")
+        ring_row.addWidget(self.test_tone_btn)
         aform.addRow(ring_row)
 
         # --- Cloning panel (will be embedded under Show Control) ---
@@ -582,6 +577,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self.keys_summary = QtWidgets.QLabel("")
         kroot.addWidget(self.keys_summary)
 
+        # -------------------- Shortcuts tab --------------------
+        self.shortcuts_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.shortcuts_tab, "Shortcuts")
+        shot_root = QtWidgets.QVBoxLayout(self.shortcuts_tab)
+        self.shortcuts_table = QtWidgets.QTableWidget(0, 2)
+        self.shortcuts_table.setHorizontalHeaderLabels(["Action", "Keybinding"])
+        self.shortcuts_table.horizontalHeader().setStretchLastSection(True)
+        self.shortcuts_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.shortcuts_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        shot_root.addWidget(self.shortcuts_table, 1)
+        shot_btns = QtWidgets.QHBoxLayout()
+        self.shortcuts_apply_btn = QtWidgets.QPushButton("Apply")
+        self.shortcuts_reset_btn = QtWidgets.QPushButton("Reset to Defaults")
+        shot_btns.addWidget(self.shortcuts_apply_btn)
+        shot_btns.addWidget(self.shortcuts_reset_btn)
+        shot_btns.addStretch(1)
+        shot_root.addLayout(shot_btns)
+        tip = QtWidgets.QLabel("Tip: On macOS, 'Meta' = Command. Shortcuts work when the app is focused.")
+        tip.setStyleSheet("color:#777; font-size:11px")
+        shot_root.addWidget(tip)
+
         # wire
         self.keys_refresh_btn.clicked.connect(self.keys_refresh)
         self.keys_filter.textChanged.connect(self.keys_refresh)
@@ -625,6 +641,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 w.valueChanged.connect(lambda _=None, ww=w: self._dirty(ww))
         self.clone_req.valueChanged.connect(lambda _=None, ww=self.clone_req: self._dirty(ww))
 
+        # Shortcuts tab handlers
+        self.shortcuts_apply_btn.clicked.connect(self.on_shortcuts_apply)
+        self.shortcuts_reset_btn.clicked.connect(self.on_shortcuts_reset)
+
         # Poll timer
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh_state)
@@ -644,6 +664,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.keys_refresh()
         except Exception:
             pass
+
+        # Initialize keyboard shortcuts
+        self._shortcuts = {}
+        self._shortcuts_model = self._load_shortcuts()
+        self._populate_shortcuts_table()
+        self._bind_shortcuts()
 
     # ----------------- ElevenLabs keyring helpers -----------------
     @staticmethod
@@ -929,6 +955,129 @@ class MainWindow(QtWidgets.QMainWindow):
         ok = res.get("ok", False)
         self.status.showMessage("Hook set" if ok else f"Hook error: {res.get('error','')}", 2000)
 
+    # ----------------- Shortcuts helpers -----------------
+    @staticmethod
+    def _shortcuts_path() -> Path:
+        return Path.home() / ".bigbird" / "shortcuts.json"
+
+    @staticmethod
+    def _default_shortcuts() -> dict:
+        # Use Qt portable sequences; users can customize in the Shortcuts tab
+        import sys as _sys
+        primary = "Meta" if _sys.platform == "darwin" else "Ctrl"
+        return {
+            "vad_force_end": f"{primary}+Shift+V",
+            "abort_tts": f"{primary}+Shift+A",
+            "end_conversation": f"{primary}+Shift+C",
+            "hook_auto": f"{primary}+Alt+A",
+            "hook_offhook": f"{primary}+Alt+O",
+            "hook_onhook": f"{primary}+Alt+H",
+            "ring_double_buzz": f"{primary}+Shift+R",
+            "led_off": f"{primary}+Shift+0",
+            "led_recording": f"{primary}+Shift+1",
+            "led_replying": f"{primary}+Shift+2",
+            "led_processing": f"{primary}+Shift+3",
+        }
+
+    @staticmethod
+    def _ensure_shortcuts_file():
+        p = MainWindow._shortcuts_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists():
+            p.write_text(json.dumps(MainWindow._default_shortcuts(), indent=2), encoding="utf-8")
+
+    def _load_shortcuts(self) -> dict:
+        try:
+            self._ensure_shortcuts_file()
+            data = json.loads(self._shortcuts_path().read_text(encoding="utf-8"))
+            # merge with defaults in case new actions were added
+            merged = dict(MainWindow._default_shortcuts())
+            if isinstance(data, dict):
+                merged.update({k: v for k, v in data.items() if isinstance(v, str)})
+            return merged
+        except Exception:
+            return dict(MainWindow._default_shortcuts())
+
+    def _save_shortcuts(self, data: dict):
+        try:
+            MainWindow._shortcuts_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _actions_catalog(self) -> list:
+        # id, label, binder (callable to trigger)
+        return [
+            ("vad_force_end", "Trigger VAD End", self.on_director_force_vad),
+            ("abort_tts", "Abort TTS", self.on_director_abort_tts),
+            ("end_conversation", "End Conversation", self.on_director_end_conv),
+            ("hook_auto", "Hook: Auto", lambda: (self.hook_auto_btn.setChecked(True), self.on_hook_latch("auto"))),
+            ("hook_offhook", "Hook: Off-hook", lambda: (self.hook_off_btn.setChecked(True), self.on_hook_latch("offhook"))),
+            ("hook_onhook", "Hook: On-hook", lambda: (self.hook_on_btn.setChecked(True), self.on_hook_latch("onhook"))),
+            ("ring_double_buzz", "Ring: Double Buzz", lambda: self.on_ring("double")),
+            ("led_off", "LED: OFF", lambda: self.on_led_set("OFF")),
+            ("led_recording", "LED: RECORDING", lambda: self.on_led_set("RECORDING")),
+            ("led_replying", "LED: REPLYING", lambda: self.on_led_set("REPLYING")),
+            ("led_processing", "LED: PROCESSING", lambda: self.on_led_set("PROCESSING")),
+        ]
+
+    def _populate_shortcuts_table(self):
+        self.shortcuts_table.setRowCount(0)
+        data = self._shortcuts_model or {}
+        for (aid, label, _handler) in self._actions_catalog():
+            row = self.shortcuts_table.rowCount()
+            self.shortcuts_table.insertRow(row)
+            self.shortcuts_table.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
+            # Key editor widget
+            editor = QtWidgets.QKeySequenceEdit()
+            seq_str = data.get(aid, "") or ""
+            if seq_str:
+                editor.setKeySequence(QtGui.QKeySequence(seq_str))
+            editor.setProperty("action_id", aid)
+            self.shortcuts_table.setCellWidget(row, 1, editor)
+
+    def _bind_shortcuts(self):
+        # Clear old
+        for s in list(getattr(self, "_shortcuts", {}).values()):
+            try:
+                s.setParent(None)
+            except Exception:
+                pass
+        self._shortcuts = {}
+
+        for aid, _label, handler in self._actions_catalog():
+            seq_str = (self._shortcuts_model or {}).get(aid, "") or ""
+            if not seq_str:
+                continue
+            try:
+                sc = QtWidgets.QShortcut(QtGui.QKeySequence(seq_str), self)
+                sc.setContext(QtCore.Qt.ApplicationShortcut)
+                sc.activated.connect(handler)
+                self._shortcuts[aid] = sc
+            except Exception:
+                pass
+
+    def on_shortcuts_apply(self):
+        # Read current table values
+        data = dict(self._shortcuts_model or {})
+        rows = self.shortcuts_table.rowCount()
+        for r in range(rows):
+            w = self.shortcuts_table.cellWidget(r, 1)
+            if isinstance(w, QtWidgets.QKeySequenceEdit):
+                aid = w.property("action_id")
+                seq = w.keySequence().toString(QtGui.QKeySequence.PortableText)
+                data[str(aid)] = seq
+        self._shortcuts_model = data
+        self._save_shortcuts(data)
+        self._bind_shortcuts()
+        self.status.showMessage("Shortcuts applied", 2000)
+
+    def on_shortcuts_reset(self):
+        self._shortcuts_model = MainWindow._default_shortcuts()
+        self._save_shortcuts(self._shortcuts_model)
+        self._populate_shortcuts_table()
+        self._bind_shortcuts()
+        self.status.showMessage("Shortcuts reset to defaults", 2000)
+
     # ---- "Dirty" state helpers ----
     def _dirty(self, widget, sec: float = 2.0):
         if not hasattr(self, "_dirty_until"):
@@ -1078,7 +1227,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(msg, 2000)
 
     def on_ring(self, pattern):
-        res = api.post("/arduino/ring", {"pattern": pattern})
+        # Only support double buzz from the GUI
+        res = api.post("/arduino/ring", {"pattern": "double", "mode": "buzz"})
         ok = res.get("ok", False)
         self.status.showMessage("Ringing…" if ok else f"Ring error: {res.get('error','')}", 2000)
 
@@ -1362,15 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ek_rem = ek.get("remaining_ivc", "—")
         ek_str = f"   EL: {ek_alias} rem:{ek_rem}"
         self.sys_label.setText(f"cpu: {cpu}%   mem: {mem}   clones: {clones}{split_str}{ek_str}")
-        # Audio route display
-        ar = data.get("audio_route", {}) or {}
-        dev = ar.get("device", "—")
-        rr = ar.get("requested_rate", "—")
-        dr = ar.get("device_rate", "—")
-        ch = ar.get("device_channels", "—")
-        fr = ar.get("frames", "—")
-        pb = ar.get("prebuffer_ms", "—")
-        self.audio_info.setText(f"Audio: {dev}  req {rr} Hz → dev {dr} Hz  ch {ch}  buf {fr}  pre {pb}ms")
+        # (Audio route debug removed)
         # remember active EL alias for filtering
         self._active_el_alias = ek.get("active_alias", "—") if isinstance(ek, dict) else "—"
 

@@ -5259,18 +5259,50 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
     @app.post("/arduino/ring")
     def arduino_ring(payload: dict):
         """
-        payload: {"pattern":"single"|"double"}
+        payload: {
+          "pattern": "single"|"double",   # default: single
+          "mode":    "bell"|"buzz"|"auto"  # default: auto
+        }
         """
-        pat = payload.get("pattern", "single")
+        pat = (payload.get("pattern") or "single").strip().lower()
+        mode = (payload.get("mode") or "auto").strip().lower()
+        if pat not in ("single", "double"):
+            return {"ok": False, "error": "bad pattern"}
+        if mode not in ("bell", "buzz", "auto"):
+            return {"ok": False, "error": "bad mode"}
         a = get_arduino()
         if not a:
             return {"ok": False, "error": "arduino not connected"}
         try:
+            # Prefer dedicated helper for double buzz if requested
+            if pat == "double" and mode in ("buzz", "auto"):
+                # Existing firmware helper; backwards compatible
+                try:
+                    a.double_ring()
+                    return {"ok": True, "cmd": "DOUBLEBUZZ"}
+                except Exception:
+                    pass
+
+            # Determine command based on requested mode
             if pat == "double":
-                a.double_ring()
+                bell_cmds = ["DOUBLERING", "DOUBLEBELL"]
+                buzz_cmds = ["DOUBLEBUZZ"]
             else:
-                a.send_command("SINGLEBUZZ")
-            return {"ok": True}
+                bell_cmds = ["SINGLERING", "SINGLEBELL"]
+                buzz_cmds = ["SINGLEBUZZ"]
+
+            cmd = None
+            if mode == "bell":
+                cmd = bell_cmds[0]
+            elif mode == "buzz":
+                cmd = buzz_cmds[0]
+            else:  # auto: prefer bell-style names, fall back to buzz
+                cmd = bell_cmds[0] if bell_cmds else (buzz_cmds[0] if buzz_cmds else None)
+                if cmd is None:
+                    return {"ok": False, "error": "no ring command available"}
+
+            a.send_command(cmd)
+            return {"ok": True, "cmd": cmd}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
