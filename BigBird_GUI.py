@@ -182,6 +182,13 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.output)
         self.apply_audio_btn = QtWidgets.QPushButton("Apply Audio")
         top.addWidget(self.apply_audio_btn)
+        # Audio debug info: requested vs device rate
+        self.audio_info = QtWidgets.QLabel("Audio: —")
+        self.audio_info.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        top.addWidget(self.audio_info)
+        # Test tone button
+        self.test_tone_btn = QtWidgets.QPushButton("Test Tone (1 kHz @ 44.1k)")
+        top.addWidget(self.test_tone_btn)
 
         # GUI overrides toggle — when off, backend ignores GUI/preset changes
         self.override_chk = QtWidgets.QCheckBox("Overwrite script settings")
@@ -303,7 +310,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arduino_tab = QtWidgets.QWidget()
         aform = QtWidgets.QFormLayout(self.arduino_tab)
         self.ard_status = QtWidgets.QLabel("port: —   connected: —   override(hook/led): —/—")
+        # Live hook state indicator for debugging
+        self.hook_state_lbl = QtWidgets.QLabel("hook: —   raw: —")
+        self.hook_state_lbl.setStyleSheet("color: #aaa;")
         aform.addRow(self.ard_status)
+        aform.addRow(self.hook_state_lbl)
 
         # Hook override (latched buttons)
         hook_row = QtWidgets.QHBoxLayout()
@@ -314,7 +325,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hook_auto_btn.setCheckable(True)
         self.hook_auto_btn.setAutoExclusive(True)
 
-        self.hook_off_btn = QtWidgets.QToolButton()
+        self.hook_off_btn = QtWidgets.QToolButton() 
         self.hook_off_btn.setText("Off-hook")
         self.hook_off_btn.setCheckable(True)
         self.hook_off_btn.setAutoExclusive(True)
@@ -527,6 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Wire up actions
         self.apply_engine_btn.clicked.connect(self.on_apply_engine)
         self.apply_audio_btn.clicked.connect(self.on_apply_audio)
+        self.test_tone_btn.clicked.connect(self.on_test_tone)
         self.apply_playht.clicked.connect(self.on_apply_playht)
         self.apply_eleven.clicked.connect(self.on_apply_eleven)
         self.apply_vad.clicked.connect(self.on_apply_vad)
@@ -983,6 +995,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage(f"Audio updated ({'ok' if res.get('ok', True) else res.get('error','err')})", 2000)
         self._clear_dirty(self.output, self.streaming)
 
+    def on_test_tone(self):
+        payload = {"seconds": 5, "freq": 1000.0, "rate": 44100, "device": "BlackHole"}
+        res = api.post("/audio/test_tone", payload)
+        if res.get("ok", False):
+            dev = res.get("device", "?")
+            rate = res.get("rate", "?")
+            ch = res.get("channels", "?")
+            self.status.showMessage(f"Tone sent to {dev} @ {rate} Hz ch {ch}", 2000)
+        else:
+            self.status.showMessage(f"Test tone error: {res.get('error','')}", 3000)
+
     def on_apply_playht(self):
         payload = {
             "speed": float(self.p_speed.value()),
@@ -1071,6 +1094,20 @@ class MainWindow(QtWidgets.QMainWindow):
         hook = ov.get("hook", "auto")
         led = ov.get("led", "OFF")
         self.ard_status.setText(f"port: {port}   connected: {conn}   override(hook/led): {hook}/{led}")
+        # Live hook state/last raw for diagnosing
+        hold = st.get("hold", None)
+        hook_state = st.get("hook_state", None)
+        raw = st.get("raw", None)
+        disp = hook_state if hook_state else "—"
+        raw_disp = raw if isinstance(raw, str) and raw.strip() else "—"
+        self.hook_state_lbl.setText(f"hook: {disp}   raw: {raw_disp}")
+        # Colorize: green for offhook, red for onhook, grey unknown
+        if hook_state == "offhook":
+            self.hook_state_lbl.setStyleSheet("color: #3c763d;")
+        elif hook_state == "onhook":
+            self.hook_state_lbl.setStyleSheet("color: #a94442;")
+        else:
+            self.hook_state_lbl.setStyleSheet("color: #aaa;")
         # update LED indicator
         self._set_led_indicator_color(led or "OFF")
         val = "auto" if hook in (None, "auto") else str(hook)
@@ -1325,6 +1362,15 @@ class MainWindow(QtWidgets.QMainWindow):
         ek_rem = ek.get("remaining_ivc", "—")
         ek_str = f"   EL: {ek_alias} rem:{ek_rem}"
         self.sys_label.setText(f"cpu: {cpu}%   mem: {mem}   clones: {clones}{split_str}{ek_str}")
+        # Audio route display
+        ar = data.get("audio_route", {}) or {}
+        dev = ar.get("device", "—")
+        rr = ar.get("requested_rate", "—")
+        dr = ar.get("device_rate", "—")
+        ch = ar.get("device_channels", "—")
+        fr = ar.get("frames", "—")
+        pb = ar.get("prebuffer_ms", "—")
+        self.audio_info.setText(f"Audio: {dev}  req {rr} Hz → dev {dr} Hz  ch {ch}  buf {fr}  pre {pb}ms")
         # remember active EL alias for filtering
         self._active_el_alias = ek.get("active_alias", "—") if isinstance(ek, dict) else "—"
 

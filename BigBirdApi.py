@@ -23,6 +23,23 @@ from openai import OpenAI
 from pyht import Client, TTSOptions, Format
 import urllib.parse
 
+# Import streamToSpeakers from a sibling module (no package required)
+try:
+    from outScript import streamToSpeakers  # preferred: outScript.py in same folder
+except ModuleNotFoundError:
+    try:
+        from tester import streamToSpeakers  # fallback: tester.py in same folder
+    except ModuleNotFoundError:
+        # Last resort: add this file's directory to sys.path and retry
+        import sys as _sys, os as _os
+        _dir = _os.path.dirname(__file__)
+        if _dir not in _sys.path:
+            _sys.path.append(_dir)
+        try:
+            from outScript import streamToSpeakers
+        except ModuleNotFoundError:
+            from tester import streamToSpeakers
+
 from dotenv import load_dotenv
 import logging
 
@@ -51,8 +68,21 @@ try:
 except Exception:
     EL_VoiceSettings = None
 from io import BytesIO
+import io
 from typing import AsyncGenerator, AsyncIterable, Generator, Iterable, Union, Optional, List
 import struct, binascii   # add at top of the file if not already there
+import numpy as np
+
+from scipy.signal import resample_poly
+
+# Safe import for WebSocket close exceptions (PlayHT streaming)
+try:
+    from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+except Exception:
+    class ConnectionClosedError(Exception):
+        pass
+    class ConnectionClosedOK(Exception):
+        pass
 
 
 from dataclasses import dataclass, field
@@ -93,7 +123,7 @@ def _load_whisper_module():
 
 # Ensure runtime directories exist
 def ensure_directories():
-    for d in ["RecordedAudio", "RecordedAudio/New", "RecordedAudio/Old"]:
+    for d in ["RecordedAudio", "RecordedAudio/New", "RecordedAudio/Old", "RecordedAudio/PoemChunks"]:
         try:
             os.makedirs(d, exist_ok=True)
         except Exception as e:
@@ -126,12 +156,20 @@ def admin_clear_transient_flags():
     ADMIN_ABORT_TTS.clear()
 
 def should_abort_playback() -> bool:
-    """Return True if playback should be aborted due to admin override or on-hook."""
+    """Return True if playback should be aborted due to admin override or OFF‑HOOK.
+
+    Semantics across the app:
+    - On‑hook (onHold() == True): handset is down; background cycles (ring/word/poem/music)
+      should CONTINUE playing.
+    - Off‑hook (onHold() == False): handset lifted; any background playback should abort
+      so the live conversation can resume.
+    """
     if ADMIN_ABORT_TTS.is_set() or ADMIN_END_CONVERSATION.is_set():
         return True
     try:
         a = get_arduino()
-        if a and a.onHold():
+        # Abort only when OFF‑HOOK
+        if a and (not a.onHold()):
             return True
     except Exception:
         pass
@@ -163,9 +201,9 @@ class ElevenLabsSettings:
     style: float = 0.15
     speed: float = 1.0
     model_id_stream: str = "eleven_v3"
-    format_stream: str = "mp3_22050_32"
+    format_stream: str = "pcm_44100"
     model_id_buffered: str = "eleven_v3"
-    format_buffered: str = "mp3_44100_128"
+    format_buffered: str = "pcm_44100"
 
 @dataclass
 class VADSettings:
@@ -184,6 +222,7 @@ class UIState:
     messages: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
     lock: RLock = field(default_factory=RLock)
     gui_overrides: bool = False  # default to off so GUI doesn't override script on launch
+    audio_route: dict = field(default_factory=dict)  # debug: requested vs device rates/channels/frames
 
     def set_gui_overrides(self, enabled: bool):
         with self.lock:
@@ -201,6 +240,7 @@ class UIState:
                 "messages": list(self.messages),
                 "system": get_system_snapshot(),
                 "gui_overrides": self.gui_overrides,
+                "audio_route": dict(self.audio_route or {}),
             }
             try:
                 data["clones"] = voice_clone_manager.get_clone_info()
@@ -686,8 +726,8 @@ client = OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT) if OPENAI_PROJEC
 def debug_print_openai_creds():
     key = os.getenv('OPENAI_API_KEY') or ''
     proj = os.getenv('OPENAI_PROJECT') or ''
-    print(f"OPENAI_API_KEY set: {'yes' if key else 'no'} (prefix: {key[:7]+'…' if key else '—'})")
-    print(f"OPENAI_PROJECT set: {'yes' if proj else 'no'} (value: {proj if proj else '—'})")
+    logging.info(f"OPENAI_API_KEY set: {'yes' if key else 'no'} (prefix: {key[:7]+'…' if key else '—'})")
+    logging.info(f"OPENAI_PROJECT set: {'yes' if proj else 'no'} (value: {proj if proj else '—'})")
 
 # Sanity-check helper to print which OpenAI credentials are in use
 debug_print_openai_creds()
@@ -764,6 +804,12 @@ New = "RecordedAudio/New"
 
 SoundTrack = "/Users/x/myenv/bin/tester.wav"
 
+# Debug/temporary routing: when True, anything targeted at the
+# BlackHole device will be written to a WAV file under RecordedAudio/
+# instead of being sent to the BlackHole output. This helps validate
+# chunking/sample‑rate without the virtual device in the loop.
+BLACKHOLE_WRITE_TO_FILE = str(os.getenv("BLACKHOLE_WRITE_TO_FILE", "0")).strip().lower() in {"1","true","yes","on"}
+
 
 arduinoLocation = '/dev/tty.usbmodem744DBDA236D82'
 
@@ -797,10 +843,21 @@ def set_arduino_led_override(state):
 
 def get_arduino_status():
     a = get_arduino()
+    hold = None
+    raw = None
+    if a:
+        try:
+            hold = bool(a.onHold())
+            raw = getattr(a, "_last_hook_raw", None)
+        except Exception:
+            pass
     return {
         "override": dict(_arduino_override),
         "port": arduinoLocation,
         "connected": bool(a and getattr(a, "serial", None)),
+        "hold": hold,  # True=on-hook, False=off-hook, None=unknown
+        "hook_state": ("onhook" if hold else ("offhook" if hold is False else None)),
+        "raw": raw,
     }
 
 def set_led_state(name: str) -> bool:
@@ -832,6 +889,454 @@ ensure_directories()
 
 # Log configured TTS engine
 logging.info(f"Configured TTS_ENGINE={TTS_ENGINE}")
+
+# Global device-output guard to prevent multiple PyAudio streams to the same
+# virtual device (e.g., BlackHole) from fighting and causing dropouts.
+class _DeviceStreamRegistry:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active: list[callable] = []  # list of stop callbacks
+
+    def stop_all(self):
+        with self._lock:
+            stops = list(self._active)
+            self._active.clear()
+        for fn in stops:
+            try:
+                fn()
+            except Exception:
+                pass
+
+    def register(self, stop_fn):
+        with self._lock:
+            self._active.append(stop_fn)
+
+_DEVICE_STREAMS = _DeviceStreamRegistry()
+
+# --------------------------------------------------------------
+# ElevenLabs HTTP stream → BlackHole (robust to MP3 fallback)
+# --------------------------------------------------------------
+API_URL_TTS_STREAM = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream"
+
+def _find_output_device_index(pa: pyaudio.PyAudio, name_substr: str = "BlackHole") -> tuple[int, dict]:
+    idx = None
+    info_m = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if name_substr.lower() in str(info.get('name','')).lower():
+            idx = i
+            info_m = info
+            break
+    if idx is None:
+        raise RuntimeError(f"Output device containing '{name_substr}' not found")
+    return idx, info_m
+
+def _upmix_mono16_to_stereo(pcm: bytes) -> bytes:
+    if not pcm:
+        return pcm
+    # fast interleave mono→stereo without numpy allocations
+    out = bytearray(len(pcm) * 2)
+    mv = memoryview(out)
+    mv[0::4] = pcm[0::2]
+    mv[1::4] = pcm[1::2]
+    mv[2::4] = pcm[0::2]
+    mv[3::4] = pcm[1::2]
+    return bytes(out)
+
+def _strip_wav_header_if_present(buf: bytearray) -> tuple[bytes, bool]:
+    """If `buf` holds a full RIFF/WAVE header, strip it and return payload + True.
+    If no header (raw PCM), return bytes(buf) + True. If incomplete header, return b'' + False.
+    """
+    if len(buf) < 32:
+        return b"", False
+    if buf[0:4] != b"RIFF" or buf[8:12] != b"WAVE":
+        return bytes(buf), True
+    i = buf.find(b"data", 12)
+    if i == -1 or i + 8 > len(buf):
+        return b"", False
+    payload = bytes(buf[i+8:])
+    del buf[:i+8]
+    return payload, True
+
+def stream_eleven_http_to_blackhole(voice_id: str, text: str,
+                                    *,
+                                    model_id: str = "eleven_v3",
+                                    device_hint: str = "BlackHole",
+                                    device_rate: int = 44100,
+                                    frames_per_buffer: int = 1024,
+                                    jitter_ms: int = 150,
+                                    requested_of: str = None) -> None:
+    """
+    Stream ElevenLabs TTS over raw HTTP to BlackHole, handling cases where the
+    provider returns MP3 despite PCM being requested. MP3 is decoded to PCM
+    (requires pydub + ffmpeg). PCM path strips an initial WAV header if present
+    and maintains a small jitter buffer.
+    """
+    api_key = eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise RuntimeError("No ElevenLabs API key available")
+
+    url = API_URL_TTS_STREAM.format(voice_id=voice_id)
+    of = requested_of or f"pcm_{int(device_rate)}"
+    url = f"{url}?output_format={of}"
+    headers = {
+        "xi-api-key": api_key,
+        "accept": "audio/wav",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": model_id,
+        "output_format": of,
+    }
+
+    # Ensure device is free
+    try:
+        _DEVICE_STREAMS.stop_all()
+    except Exception:
+        pass
+
+    resp = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+    if resp.status_code != 200:
+        ct = resp.headers.get("Content-Type", "?")
+        body = (resp.text or "")[:400]
+        raise RuntimeError(f"HTTP {resp.status_code} from ElevenLabs (CT={ct}): {body}")
+
+    ct = (resp.headers.get("Content-Type", "") or "").lower()
+    is_mp3 = ("mpeg" in ct) or ("mp3" in ct)
+
+    p = pyaudio.PyAudio()
+    try:
+        dev_idx, dev_info = _find_output_device_index(p, name_substr=device_hint)
+        chans = 2 if int(dev_info.get("maxOutputChannels") or 1) >= 2 else 1
+        # Open at device_rate (Ableton is set accordingly)
+        stream = p.open(format=pyaudio.paInt16,
+                        channels=chans,
+                        rate=int(device_rate),
+                        output=True,
+                        output_device_index=dev_idx,
+                        frames_per_buffer=int(frames_per_buffer))
+
+        # Register a stop callback so other paths can preempt
+        try:
+            _DEVICE_STREAMS.register(lambda: (stream.stop_stream(), stream.close()))
+        except Exception:
+            pass
+
+        if is_mp3:
+            # Accumulate then decode MP3 to PCM (blocking playback)
+            mp3_buf = bytearray()
+            for chunk in resp.iter_content(chunk_size=4096):
+                if chunk:
+                    mp3_buf.extend(chunk)
+            try:
+                from pydub import AudioSegment
+                seg = AudioSegment.from_file(io.BytesIO(bytes(mp3_buf)), format="mp3")
+                seg = seg.set_frame_rate(int(device_rate)).set_channels(int(chans)).set_sample_width(2)
+                pcm = seg.raw_data
+            except Exception as e:
+                raise RuntimeError(f"Received MP3 stream and failed to decode: {e}")
+            step = int(frames_per_buffer) * chans * 2
+            for i in range(0, len(pcm), step):
+                if should_abort_playback():
+                    break
+                stream.write(pcm[i:i+step], exception_on_underflow=False)
+            try:
+                stream.stop_stream(); stream.close()
+            except Exception:
+                pass
+            return
+
+        # PCM path with WAV header strip + jitter buffer
+        header_parsed = False
+        tail = b""
+        jb = bytearray()
+        jitter_bytes = int(device_rate * (2 if chans==2 else 1) * 2 * (int(jitter_ms)/1000.0))
+
+        for chunk in resp.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            if should_abort_playback():
+                break
+            if not header_parsed:
+                jb.extend(chunk)
+                data, header_parsed = _strip_wav_header_if_present(jb)
+                if not header_parsed:
+                    continue
+                if data:
+                    jb = bytearray(data)
+                if len(jb) < jitter_bytes:
+                    continue
+            else:
+                jb.extend(chunk)
+
+            buf = tail + jb
+            if len(buf) & 1:
+                tail = buf[-1:]
+                buf = buf[:-1]
+            else:
+                tail = b""
+            jb.clear()
+            if not buf:
+                continue
+            out = _upmix_mono16_to_stereo(buf) if chans == 2 else buf
+            stream.write(out, exception_on_underflow=False)
+
+        try:
+            stream.stop_stream(); stream.close()
+        except Exception:
+            pass
+    finally:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+class ElevenHTTPStreamPlayer:
+    """
+    Robust ElevenLabs → HTTP stream → BlackHole player.
+    Wraps `stream_eleven_http_to_blackhole` and resolves sensible defaults
+    from ui_state and your key/clone managers.
+    """
+    def __init__(self,
+                 device_hint: str = 'BlackHole',
+                 device_rate: int = 44100,
+                 frames_per_buffer: int = 1024,
+                 jitter_ms: int = 200,
+                 output_format: str | None = None):
+        self.device_hint = device_hint
+        self.device_rate = int(device_rate)
+        self.frames_per_buffer = int(frames_per_buffer)
+        self.jitter_ms = int(jitter_ms)
+        self.output_format = output_format  # e.g. 'pcm_44100' or 'pcm_24000'
+
+    def _resolve_voice_id(self) -> str | None:
+        try:
+            vid = voice_clone_manager.get_recent_clone_id(engine='elevenlabs')
+            if vid:
+                return vid
+        except Exception:
+            pass
+        return os.getenv('ELEVENLABS_VOICE_ID')
+
+    def _resolve_model_id(self) -> str:
+        try:
+            return ui_state.elevenlabs.model_id_stream or 'eleven_v3'
+        except Exception:
+            return 'eleven_v3'
+
+    def play_text(self, text: str,
+                  *, voice_id: str | None = None,
+                  model_id: str | None = None,
+                  output_format: str | None = None) -> None:
+        if not text:
+            return
+        vid = voice_id or self._resolve_voice_id()
+        if not vid:
+            logging.error("ElevenHTTPStreamPlayer: no ElevenLabs voice_id available")
+            return
+        mid = model_id or self._resolve_model_id()
+        of  = output_format or self.output_format or f"pcm_{self.device_rate}"
+        try:
+            stream_eleven_http_to_blackhole(
+                voice_id=vid,
+                text=text,
+                model_id=mid,
+                device_hint=self.device_hint,
+                device_rate=self.device_rate,
+                frames_per_buffer=self.frames_per_buffer,
+                jitter_ms=self.jitter_ms,
+                requested_of=of,
+            )
+        except Exception as e:
+            logging.warning(f"ElevenHTTPStreamPlayer fallback (HTTP stream failed): {e}")
+            # Buffered fallback: download full PCM and play via ElevenFakeStreamer
+            try:
+                ElevenFakeStreamer(device_hint=self.device_hint, rate=self.device_rate).start([text]).wait()
+            except Exception as e2:
+                logging.error(f"ElevenHTTPStreamPlayer buffered fallback failed: {e2}")
+
+
+def speak_eleven_http_blackhole(text: str,
+                                *,
+                                device_rate: int = 44100,
+                                jitter_ms: int = 200,
+                                frames_per_buffer: int = 1024,
+                                output_format: str | None = None) -> None:
+    """Convenience wrapper used by background cycles."""
+    try:
+        ElevenHTTPStreamPlayer(device_rate=device_rate,
+                               jitter_ms=jitter_ms,
+                               frames_per_buffer=frames_per_buffer,
+                               output_format=output_format).play_text(text)
+    except Exception as e:
+        logging.error(f"speak_eleven_http_blackhole failed: {e}")
+        
+# --------------------------------------------------------------
+# Fake realtime streamer: buffered file-by-file playback
+# --------------------------------------------------------------
+class ElevenFakeStreamer:
+    def __init__(self, device_hint: str = 'BlackHole', rate: int = 44100, buffer_files: int = 2,
+                 out_dir: str = 'RecordedAudio/PoemChunks'):
+        self.device_hint = device_hint
+        self.rate = int(rate)
+        self.buffer_files = max(0, int(buffer_files))
+        self.out_dir = out_dir
+        os.makedirs(self.out_dir, exist_ok=True)
+        # state
+        self._ready = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._producer = None
+        self._consumer = None
+
+    def stop(self):
+        self._stop.set()
+
+    def _write_chunk_wav(self, pcm: bytes, idx: int) -> str:
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        tmp_path = os.path.join(self.out_dir, f"chunk_{ts}_{idx:03d}.part")
+        final_path = tmp_path.replace('.part', '.wav')
+        with wave.open(tmp_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.rate)
+            wf.writeframes(pcm if not (len(pcm) & 1) else pcm[:-1])
+        os.replace(tmp_path, final_path)
+        return final_path
+
+    def _produce(self, lines: list[str]):
+        try:
+            eleven_client_manager.ensure_fresh()
+            for i, text in enumerate(lines):
+                if self._stop.is_set():
+                    break
+                # Fetch full PCM for the line
+                audio = eleven_client_manager.client.text_to_speech.convert(
+                    text=text,
+                    voice_id=(voice_clone_manager.get_recent_clone_id(engine='elevenlabs') or os.getenv('ELEVENLABS_VOICE_ID')),
+                    model_id=(ui_state.elevenlabs.model_id_buffered or 'eleven_v3'),
+                    output_format=f"pcm_{self.rate}",
+                )
+                # Normalize to bytes
+                if isinstance(audio, (bytes, bytearray)):
+                    pcm = bytes(audio)
+                else:
+                    bb = bytearray()
+                    for ch in audio:
+                        if ch:
+                            bb.extend(ch)
+                    pcm = bytes(bb)
+                path = self._write_chunk_wav(pcm, i)
+                with self._lock:
+                    self._ready.append(path)
+        except Exception as e:
+            logging.warning(f"FakeStreamer produce error: {e}")
+        finally:
+            # signal end by appending None sentinel
+            with self._lock:
+                self._ready.append(None)
+
+    def _open_device(self):
+        pa = pyaudio.PyAudio()
+        idx = None
+        info_m = None
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if self.device_hint.lower() in str(info.get('name','')).lower():
+                idx = i
+                info_m = info
+                break
+        if idx is None:
+            pa.terminate()
+            raise RuntimeError(f"Output device containing '{self.device_hint}' not found")
+        channels = 2 if int(info_m.get('maxOutputChannels') or 1) >= 2 else 1
+        frames = int(os.getenv('PYAUDIO_FRAMES', str(CHUNK)))
+        stream = pa.open(format=pyaudio.paInt16, channels=channels, rate=self.rate, output=True,
+                         output_device_index=idx, frames_per_buffer=frames)
+        return pa, stream, channels
+
+    def _play_file(self, stream: pyaudio.Stream, channels: int, path: str):
+        with contextlib.closing(wave.open(path, 'rb')) as wf:
+            # If file rate differs, simple on-the-fly fallback (PortAudio may resample)
+            # We keep it simple assuming rate matches.
+            while True:
+                if should_abort_playback() or self._stop.is_set():
+                    return
+                data = wf.readframes(CHUNK)
+                if not data:
+                    break
+                if channels == 2 and wf.getnchannels() == 1:
+                    out = bytearray(len(data) * 2)
+                    mv = memoryview(out)
+                    mv[0::4] = data[0::2]
+                    mv[1::4] = data[1::2]
+                    mv[2::4] = data[0::2]
+                    mv[3::4] = data[1::2]
+                    data = bytes(out)
+                stream.write(data)
+
+    def _consume(self):
+        # ensure no other stream holds the device
+        try:
+            _DEVICE_STREAMS.stop_all()
+        except Exception:
+            pass
+        pa, stream, channels = self._open_device()
+        try:
+            # Optional initial buffer gap
+            while True:
+                with self._lock:
+                    ready_count = sum(1 for p in self._ready if p is not None)
+                if ready_count >= max(0, self.buffer_files):
+                    break
+                if self._stop.is_set():
+                    return
+                time.sleep(0.02)
+            # Playback loop
+            consumed = 0
+            while True:
+                if self._stop.is_set():
+                    break
+                next_path = None
+                with self._lock:
+                    if consumed < len(self._ready):
+                        next_path = self._ready[consumed]
+                        consumed += 1
+                if next_path is None:
+                    # Either waiting for more, or reached sentinel
+                    with self._lock:
+                        done = (len(self._ready) > 0 and self._ready[-1] is None and consumed >= len(self._ready))
+                    if done:
+                        break
+                    time.sleep(0.02)
+                    continue
+                # Sentinel means producer is finished
+                if next_path is None:
+                    break
+                # Skip sentinel markers explicitly
+                if isinstance(next_path, str):
+                    self._play_file(stream, channels, next_path)
+        finally:
+            try:
+                stream.stop_stream(); stream.close()
+            except Exception:
+                pass
+            pa.terminate()
+
+    def start(self, lines: list[str]):
+        self._producer = threading.Thread(target=self._produce, args=(list(lines),), daemon=True)
+        self._consumer = threading.Thread(target=self._consume, daemon=True)
+        self._producer.start()
+        self._consumer.start()
+        return self
+
+    def wait(self):
+        if self._producer:
+            self._producer.join()
+        if self._consumer:
+            self._consumer.join()
 
 class APIKeyManager:
     def __init__(self, keys, user_ids):
@@ -1090,6 +1595,11 @@ class AudioRecorderWithVAD:
         """Record audio and stop when speech ends, with handling for initial silence and IO errors."""
         global RECORDING_ACTIVE, RECORDING_STARTED_TS
         os.makedirs("RecordedAudio", exist_ok=True)
+        # Visibility: log input capture parameters for debugging
+        try:
+            logging.info("VAD recorder: input_rate=%d Hz, channels=%d, frame_samples=%d", self.rate, self.channels, self.frames_per_buffer)
+        except Exception:
+            pass
         stream = self.p.open(format=self.format, channels=self.channels, rate=self.rate, input=True, frames_per_buffer=self.frames_per_buffer)
         audio_frames = []
         silent_frames = collections.deque(maxlen=int(self.rate / self.frames_per_buffer * max_silence_length))
@@ -1172,6 +1682,9 @@ class ArduinoControl:
         except serial.SerialException as e:
             logging.error(f"Error connecting to Arduino: {e}")
             self.serial = None
+        # Track last raw hook response and parsed state for debugging
+        self._last_hook_raw: Optional[str] = None
+        self._last_hold: Optional[bool] = None
 
     def send_command(self, command):
         """Send a command to the Arduino."""
@@ -1192,8 +1705,10 @@ class ArduinoControl:
         try:
             hook_ovr = _arduino_override.get("hook")
             if hook_ovr == "onhook":
+                self._last_hold = True
                 return True
             if hook_ovr == "offhook":
+                self._last_hold = False
                 return False
         except Exception:
             pass
@@ -1201,20 +1716,25 @@ class ArduinoControl:
         # 2) No serial? fall back to safe default (off-hook)
         if not getattr(self, "serial", None):
             logging.debug("onHold: no Arduino serial; defaulting to OFF-HOOK (False) – use GUI override to force ON-HOOK")
-            return False
+            # keep last known if we have it, else False
+            return bool(self._last_hold) if self._last_hold is not None else False
 
         # 3) Query device
         resp = self.send_command("ISBUTTONPRESSED") or ""
+        self._last_hook_raw = str(resp)
         r = str(resp).strip().upper()
         # Map common firmware responses
-        if r in ("DOWN", "PRESSED", "LOW", "0"):
+        if r in ("DOWN", "PRESSED", "LOW", "0", "ON", "ONHOOK", "HOOK:ON", "PRESSED:1", "BTN:PRESSED"):
             # switch pressed -> handset on the cradle (ON-HOOK)
+            self._last_hold = True
             return True
-        if r in ("UP", "RELEASED", "HIGH", "1"):
+        if r in ("UP", "RELEASED", "HIGH", "1", "OFF", "OFFHOOK", "HOOK:OFF", "PRESSED:0", "BTN:RELEASED"):
             # switch released -> handset lifted (OFF-HOOK)
+            self._last_hold = False
             return False
-        logging.debug(f"onHold: unexpected ISBUTTONPRESSED -> {resp!r}; assuming OFF-HOOK")
-        return False
+        logging.debug(f"onHold: unexpected ISBUTTONPRESSED -> {resp!r}; using last known or OFF-HOOK")
+        # If unknown response, prefer last known state to avoid flapping
+        return bool(self._last_hold) if self._last_hold is not None else False
         
     def _single_ring(self, ring_clip, ring_duration):
         """Play one ring; return True if pickup detected."""
@@ -1246,6 +1766,28 @@ class ArduinoControl:
             time.sleep(0.1)
         return False
 
+    def _wait_until_offhook(self, duration: float, clip_to_stop=None) -> bool:
+        """
+        Wait up to `duration` seconds for OFF-HOOK (handset lifted).
+        If OFF-HOOK is detected, stop `clip_to_stop` (if given) and return True.
+        Return False if timeout elapses with handset still ON-HOOK.
+        """
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            try:
+                if not self.onHold():  # OFF-HOOK
+                    if clip_to_stop:
+                        try:
+                            clip_to_stop.stop()
+                        except Exception:
+                            pass
+                    logging.info("OFF-HOOK detected – stopping hold cycle")
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
     def _ring_once(self, ring_clip, ring_secs) -> bool:
         """Play one ring; abort immediately if hold is detected during playback."""
         ring_clip.play()
@@ -1265,7 +1807,7 @@ class ArduinoControl:
         """Ring the phone in a double patten."""
         command = "DOUBLEBUZZ"
         responce = self.send_command(command)     
-        print(responce)   
+        logging.info(responce)   
 
     def led_Red(self):
         """Turn LED Red."""
@@ -1385,92 +1927,96 @@ class AudioStreamer:
         self._tail_byte = b""          # keeps odd byte between chunks
 
 
-        for chunk in self.client.tts(text=text,
-                                     options=options,
-                                     voice_engine=VOICE_CLONE_MODEL,
-                                     protocol=_resolve_playht_protocol(VOICE_CLONE_MODEL, PROTOCOL)):
+        tts_iter = self.client.tts(text=text,
+                                   options=options,
+                                   voice_engine=VOICE_CLONE_MODEL,
+                                   protocol=_resolve_playht_protocol(VOICE_CLONE_MODEL, PROTOCOL))
+        try:
+            for chunk in tts_iter:
+                header_buffer.extend(chunk)
 
-            header_buffer.extend(chunk)
+                # Abort if handset is ON-HOOK or director override requests it
+                if should_abort_playback():
+                    logging.info("Abort requested – stopping live stream")
+                    break
 
-            # Abort if handset is ON-HOOK or director override requests it
-            if should_abort_playback():
-                logging.info("Abort requested – stopping live stream")
-                break
+                if not header_parsed and len(header_buffer) >= 44:
+                    # Basic RIFF sanity‑check
+                    if header_buffer[:4] != b'RIFF' or header_buffer[8:12] != b'WAVE':
+                        logging.error("First chunk is not RIFF/WAVE – aborting playback.")
+                        return
 
-            if not header_parsed and len(header_buffer) >= 44:
-                # Basic RIFF sanity‑check
-                if header_buffer[:4] != b'RIFF' or header_buffer[8:12] != b'WAVE':
-                    logging.error("First chunk is not RIFF/WAVE – aborting playback.")
-                    return
+                    # Parse fmt fields (assume no weird <fmt  > padding before byte 24)
+                    channels     = int.from_bytes(header_buffer[22:24], "little")
+                    sample_rate  = int.from_bytes(header_buffer[24:28], "little")
+                    bits_per     = int.from_bytes(header_buffer[34:36], "little")
+                    fmt_ok       = (bits_per == 16)
 
-                # Parse fmt fields (assume no weird <fmt  > padding before byte 24)
-                channels     = int.from_bytes(header_buffer[22:24], "little")
-                sample_rate  = int.from_bytes(header_buffer[24:28], "little")
-                bits_per     = int.from_bytes(header_buffer[34:36], "little")
-                fmt_ok       = (bits_per == 16)
+                    if not fmt_ok:
+                        logging.error(f"Unsupported bits/sample: {bits_per}")
+                        return
 
-                if not fmt_ok:
-                    logging.error(f"Unsupported bits/sample: {bits_per}")
-                    return
+                    # find where 'data' starts
+                    data_pos = header_buffer.find(b'data')
+                    if data_pos != -1 and len(header_buffer) >= data_pos + 8:
+                        pcm_start   = data_pos + 8
+                        pcm_chunk   = header_buffer[pcm_start:]
+                        header_parsed = True    # got everything we need
 
-                # find where 'data' starts
-                data_pos = header_buffer.find(b'data')
-                if data_pos != -1 and len(header_buffer) >= data_pos + 8:
-                    pcm_start   = data_pos + 8
-                    pcm_chunk   = header_buffer[pcm_start:]
-                    header_parsed = True    # got everything we need
+                        # Now that we know the real format, open PyAudio
+                        self.setup_audio_stream(sample_rate, channels)
 
-                    # Now that we know the real format, open PyAudio
-                    self.setup_audio_stream(sample_rate, channels)
-
-                    # ---- play the PCM that followed the header ----
-                    # prepend any stored tail‑byte from the previous packet
-                    pcm_chunk = self._tail_byte + pcm_chunk
-                    self._tail_byte = b""
-
-                    # store a dangling byte (if any) to keep 16‑bit alignment
-                    if len(pcm_chunk) & 1:
-                        self._tail_byte = pcm_chunk[-1:]
-                        pcm_chunk = pcm_chunk[:-1]
-
-                    if pcm_chunk:
-                        self.stream.write(bytes(pcm_chunk))
-                        # Abort if handset is on-hook or override
-                        if should_abort_playback():
-                            logging.info("Abort requested – stopping live stream")
-                            break
-                    continue  # header handled; wait for next pure‑PCM chunk
-                # else: keep buffering until 'data' shows up
-                continue
-
-            if header_parsed:
-                # Every further chunk SHOULD be pure PCM, but in practice
-                # PlayHT sometimes prefixes *each* network chunk with a
-                # fresh 44‑byte RIFF WAVE header.  Detect that pattern and
-                # strip any header we see before passing bytes to PyAudio.
-                if chunk[:4] == b'RIFF' and len(chunk) >= 44:
-                    data_pos = chunk.find(b'data')
-                    if data_pos != -1 and len(chunk) >= data_pos + 8:
-                        chunk = chunk[data_pos + 8 :]
-                    else:
-                        # Header is incomplete; skip it entirely
-                        chunk = chunk[44:]
-                if chunk:
-                    # 16‑bit alignment – stitch dangling byte between chunks
-                    if len(chunk) & 1:
-                        self._tail_byte = chunk[-1:]
-                        chunk = chunk[:-1]
-                    else:
-                        chunk = self._tail_byte + chunk
+                        # ---- play the PCM that followed the header ----
+                        # prepend any stored tail‑byte from the previous packet
+                        pcm_chunk = self._tail_byte + pcm_chunk
                         self._tail_byte = b""
-                    if chunk:
-                        # Abort if handset is on-hook or override
-                        if should_abort_playback():
-                            logging.info("Abort requested – stopping live stream")
-                            break
-                        self.stream.write(bytes(chunk))
 
-        # end for
+                        # store a dangling byte (if any) to keep 16‑bit alignment
+                        if len(pcm_chunk) & 1:
+                            self._tail_byte = pcm_chunk[-1:]
+                            pcm_chunk = pcm_chunk[:-1]
+
+                        if pcm_chunk:
+                            self.stream.write(bytes(pcm_chunk), exception_on_underflow=False)
+                            # Abort if handset is on-hook or override
+                            if should_abort_playback():
+                                logging.info("Abort requested – stopping live stream")
+                                break
+                        continue  # header handled; wait for next pure‑PCM chunk
+                    # else: keep buffering until 'data' shows up
+                    continue
+
+                if header_parsed:
+                    # Every further chunk SHOULD be pure PCM, but in practice
+                    # PlayHT sometimes prefixes *each* network chunk with a
+                    # fresh 44‑byte RIFF WAVE header.  Detect that pattern and
+                    # strip any header we see before passing bytes to PyAudio.
+                    if chunk[:4] == b'RIFF' and len(chunk) >= 44:
+                        data_pos = chunk.find(b'data')
+                        if data_pos != -1 and len(chunk) >= data_pos + 8:
+                            chunk = chunk[data_pos + 8 :]
+                        else:
+                            # Header is incomplete; skip it entirely
+                            chunk = chunk[44:]
+                    if chunk:
+                        # 16‑bit alignment – stitch dangling byte between chunks
+                        if len(chunk) & 1:
+                            self._tail_byte = chunk[-1:]
+                            chunk = chunk[:-1]
+                        else:
+                            chunk = self._tail_byte + chunk
+                            self._tail_byte = b""
+                        if chunk:
+                            # Abort if handset is on-hook or override
+                            if should_abort_playback():
+                                logging.info("Abort requested – stopping live stream")
+                                break
+                            self.stream.write(bytes(chunk), exception_on_underflow=False)
+            # end for
+        except (ConnectionClosedError, ConnectionClosedOK) as e:
+            logging.warning(f"PlayHT WebSocket closed during stream_audio: {e}")
+        except Exception as e:
+            logging.warning(f"PlayHT stream_audio error: {e}")
         try:
             if self.stream:
                 self.stream.stop_stream()
@@ -1539,50 +2085,55 @@ class AudioStreamerPair:
         header_buffer = bytearray()
         header_parsed = False
 
-        for chunk in out_stream:
-            if should_abort_playback():
-                logging.info("Abort requested – stopping PlayDialog stream")
-                break
-            if not chunk:
-                continue
+        try:
+            for chunk in out_stream:
+                if should_abort_playback():
+                    logging.info("Abort requested – stopping PlayDialog stream")
+                    break
+                if not chunk:
+                    continue
 
-            if not header_parsed:
-                header_buffer.extend(chunk)
+                if not header_parsed:
+                    header_buffer.extend(chunk)
 
-                # Check for a complete WAV header
-                if header_buffer[:4] == b"RIFF" and len(header_buffer) >= 44:
-                    # Channels, sample‑rate pulled from <fmt> sub‑chunk
-                    channels     = int.from_bytes(header_buffer[22:24], "little")
-                    sample_rate  = int.from_bytes(header_buffer[24:28], "little")
+                    # Check for a complete WAV header
+                    if header_buffer[:4] == b"RIFF" and len(header_buffer) >= 44:
+                        # Channels, sample‑rate pulled from <fmt> sub‑chunk
+                        channels     = int.from_bytes(header_buffer[22:24], "little")
+                        sample_rate  = int.from_bytes(header_buffer[24:28], "little")
 
-                    # Find the start of PCM data
-                    data_pos = header_buffer.find(b"data")
-                    if data_pos != -1 and len(header_buffer) >= data_pos + 8:
-                        pcm_start = data_pos + 8
-                        pcm_chunk = header_buffer[pcm_start:]
+                        # Find the start of PCM data
+                        data_pos = header_buffer.find(b"data")
+                        if data_pos != -1 and len(header_buffer) >= data_pos + 8:
+                            pcm_start = data_pos + 8
+                            pcm_chunk = header_buffer[pcm_start:]
+                        else:
+                            pcm_chunk = b""
+
+                        header_parsed = True
+                        self._setup_audio_stream(sample_rate, channels)
+
+                        if pcm_chunk:
+                            self.stream.write(bytes(pcm_chunk))
+                        continue
+
                     else:
-                        pcm_chunk = b""
+                        # No RIFF header detected – assume raw 24 kHz mono PCM
+                        header_parsed = True
+                        self._setup_audio_stream(sample_rate=ui_state.playht.sample_rate or RATE, channels=1)
+                        self.stream.write(bytes(header_buffer))
+                        continue
 
-                    header_parsed = True
-                    self._setup_audio_stream(sample_rate, channels)
-
-                    if pcm_chunk:
-                        self.stream.write(bytes(pcm_chunk))
-                    continue
-
-                else:
-                    # No RIFF header detected – assume raw 24 kHz mono PCM
-                    header_parsed = True
-                    self._setup_audio_stream(sample_rate=ui_state.playht.sample_rate or RATE, channels=1)
-                    self.stream.write(bytes(header_buffer))
-                    continue
-
-            # Already parsed header → stream every chunk
-            # Abort if handset is ON-HOOK or director override
-            if should_abort_playback():
-                logging.info("Abort requested – stopping PlayDialog stream")
-                break
-            self.stream.write(bytes(chunk))
+                # Already parsed header → stream every chunk
+                # Abort if handset is ON-HOOK or director override
+                if should_abort_playback():
+                    logging.info("Abort requested – stopping PlayDialog stream")
+                    break
+                self.stream.write(bytes(chunk))
+        except (ConnectionClosedError, ConnectionClosedOK) as e:
+            logging.warning(f"PlayHT WebSocket closed during _play_stream: {e}")
+        except Exception as e:
+            logging.warning(f"PlayHT _play_stream error: {e}")
 
     def cleanup(self):
         if self.stream:
@@ -1767,6 +2318,11 @@ class AudioStreamerBlackHole:
         sample_rate     = 24000
         self._tail_byte = b""          # keeps odd byte between chunks
 
+        # When debugging, write stream to a WAV file instead of routing to BlackHole
+        write_to_file = bool(BLACKHOLE_WRITE_TO_FILE)
+        wav_out = None
+        out_path = None
+
 
         for chunk in self.client.tts(text=text,
                                      options=options,
@@ -1777,6 +2333,12 @@ class AudioStreamerBlackHole:
             if not header_parsed and len(header_buffer) >= 44:
                 if header_buffer[:4] != b'RIFF' or header_buffer[8:12] != b'WAVE':
                     logging.error("Not a WAV stream – aborting BlackHole playback.")
+                    # Close any file writer if opened
+                    if wav_out:
+                        try:
+                            wav_out.close()
+                        except Exception:
+                            pass
                     return
 
                 channels     = int.from_bytes(header_buffer[22:24], "little")
@@ -1788,12 +2350,26 @@ class AudioStreamerBlackHole:
                     pcm_chunk   = header_buffer[pcm_start:]
                     header_parsed = True
 
-                    # open BlackHole at the correct format
-                    self.setup_audio_stream(sample_rate, channels)
+                    # Open target: either WAV file (debug) or BlackHole device
+                    if write_to_file:
+                        try:
+                            ts = time.strftime("%Y%m%d-%H%M%S")
+                            out_path = f"RecordedAudio/blackhole_debug_playht_{ts}.wav"
+                            wav_out = wave.open(out_path, 'wb')
+                            wav_out.setnchannels(channels)
+                            wav_out.setsampwidth(2)  # 16-bit PCM
+                            wav_out.setframerate(sample_rate)
+                        except Exception as e:
+                            logging.error(f"Failed to open debug WAV for writing: {e}")
+                            wav_out = None
+                            write_to_file = False
+                    else:
+                        # open BlackHole at the correct format
+                        self.setup_audio_stream(sample_rate, channels)
 
+                    # Handle dangling byte alignment
                     pcm_chunk = self._tail_byte + pcm_chunk
                     self._tail_byte = b""
-
                     if len(pcm_chunk) & 1:
                         self._tail_byte = pcm_chunk[-1:]
                         pcm_chunk = pcm_chunk[:-1]
@@ -1801,8 +2377,19 @@ class AudioStreamerBlackHole:
                     if pcm_chunk:
                         if should_abort_playback():
                             logging.info("Abort requested – stopping BlackHole stream")
+                            if wav_out:
+                                try:
+                                    wav_out.close()
+                                except Exception:
+                                    pass
                             return
-                        self.stream.write(bytes(pcm_chunk))
+                        if write_to_file and wav_out:
+                            try:
+                                wav_out.writeframes(pcm_chunk)
+                            except Exception as e:
+                                logging.error(f"Failed to write debug WAV frames: {e}")
+                        else:
+                            self.stream.write(bytes(pcm_chunk))
                     continue  # header handled
                 continue
 
@@ -1824,10 +2411,27 @@ class AudioStreamerBlackHole:
                     if chunk:
                         if should_abort_playback():
                             logging.info("Abort requested – stopping BlackHole stream")
+                            if wav_out:
+                                try:
+                                    wav_out.close()
+                                except Exception:
+                                    pass
                             return
-                        self.stream.write(bytes(chunk))
+                        if write_to_file and wav_out:
+                            try:
+                                wav_out.writeframes(chunk)
+                            except Exception as e:
+                                logging.error(f"Failed to write debug WAV frames: {e}")
+                        else:
+                            self.stream.write(bytes(chunk))
 
-
+        # End of streaming loop – close WAV if used
+        if write_to_file and wav_out:
+            try:
+                wav_out.close()
+                logging.info(f"Wrote BlackHole debug WAV to {out_path}")
+            except Exception:
+                pass
 
     def cleanup(self):
         if self.stream is not None:
@@ -1835,6 +2439,356 @@ class AudioStreamerBlackHole:
             self.stream.close()
         if self.p is not None:
             self.p.terminate()
+        # File writer, if used during stream, is closed inline after streaming
+
+# ------------------------------------------------------------------
+# ElevenLabs → Device (BlackHole/VB-CABLE) callback streamer
+# ------------------------------------------------------------------
+class ElevenToDeviceStreamer:
+    """
+    Pulls ElevenLabs streaming PCM on a producer thread into a byte ring buffer,
+    while a PortAudio callback writes fixed-size frames to a specific output device
+    (e.g., "BlackHole"), avoiding default-device routing and smoothing network jitter.
+    """
+
+    def __init__(self, client: 'ElevenLabs', device_name_substr: str = 'BlackHole',
+                 rate: int | None = None, channels: int | None = None,
+                 frames_per_buffer: int = 1024, prebuffer_ms: int | None = None):
+        self.client = client
+        self.dev_sub = device_name_substr
+        self.request_rate = rate
+        self.request_channels = channels
+        self.frames = frames_per_buffer
+        # Prebuffer window (ms) before starting device stream
+        if prebuffer_ms is None:
+            try:
+                self.prebuffer_ms = int(os.getenv('E2D_PREBUFFER_MS', '3000'))
+            except Exception:
+                self.prebuffer_ms = 3000
+        else:
+            self.prebuffer_ms = max(0, int(prebuffer_ms))
+
+        self.pa = None
+        self.stream = None
+        self.dev_index = None
+        self.dev_rate = None
+        self.dev_channels = None
+
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._producer = None
+        self._done = threading.Event()
+        self._underruns = 0
+
+    # --- helpers ---
+    def _probe_device(self):
+        pa = pyaudio.PyAudio()
+        self.pa = pa
+        idx = None
+        info_m = None
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            if self.dev_sub.lower() in str(info.get('name','')).lower():
+                idx = i
+                info_m = info
+                break
+        if idx is None:
+            raise RuntimeError(f"Output device containing '{self.dev_sub}' not found")
+        self.dev_index = idx
+        rate = int(info_m.get('defaultSampleRate') or 44100)
+        if rate not in (8000,16000,22050,24000,44100,48000):
+            rate = 44100
+        # Always track hardware/device rate; we'll resample if request differs
+        self.hw_rate = rate
+        self.dev_rate = self.hw_rate
+        max_ch = int(info_m.get('maxOutputChannels') or 2)
+        self.dev_channels = self.request_channels or (2 if max_ch >= 2 else 1)
+        try:
+            logging.info("ElevenToDeviceStreamer device='%s' index=%s hw_rate=%d ch=%d frames=%d",
+                         info_m.get('name','?'), self.dev_index, self.hw_rate, self.dev_channels, self.frames)
+        except Exception:
+            pass
+
+    def _upmix_mono_to_stereo(self, pcm: bytes) -> bytes:
+        if self.dev_channels != 2:
+            return pcm
+        if not pcm:
+            return pcm
+        if len(pcm) & 1:
+            pcm = pcm[:-1]
+        # duplicate each 16-bit sample to L and R
+        out = bytearray(len(pcm) * 2)
+        mv = memoryview(out)
+        mv[0::4] = pcm[0::2]
+        mv[1::4] = pcm[1::2]
+        mv[2::4] = pcm[0::2]
+        mv[3::4] = pcm[1::2]
+        return bytes(out)
+
+    def _push(self, data: bytes):
+        if not data:
+            return
+        with self._lock:
+            self._buf.extend(data)
+            # Cap buffer to ~10 seconds to avoid unbounded growth: 10s * rate * ch * 2
+            cap = 10 * self.dev_rate * self.dev_channels * 2
+            if len(self._buf) > cap:
+                # drop oldest bytes
+                drop = len(self._buf) - cap
+                del self._buf[:drop]
+
+    def _pull(self, nbytes: int) -> bytes:
+        with self._lock:
+            have = len(self._buf)
+            if have == 0:
+                self._underruns += 1
+                return b"\x00" * nbytes
+            if have >= nbytes:
+                out = bytes(self._buf[:nbytes])
+                del self._buf[:nbytes]
+                return out
+            out = bytes(self._buf)
+            self._buf.clear()
+        # pad with silence
+        return out + (b"\x00" * (nbytes - len(out)))
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        if should_abort_playback() and not self._buf:
+            return (None, pyaudio.paComplete)
+        nbytes = frame_count * self.dev_channels * 2
+        data = self._pull(nbytes)
+        return (data, pyaudio.paContinue)
+
+    def _producer_main(self, text: str, voice_id: str, model_id: str, out_fmt: str, voice_settings):
+        try:
+            eleven_client_manager.ensure_fresh()
+            audio_stream = eleven_client_manager.client.text_to_speech.stream(
+                text=text,
+                voice_id=voice_id,
+                model_id=model_id,
+                output_format=out_fmt,
+                voice_settings=voice_settings,
+            )
+            # Observe incoming raw PCM throughput to estimate actual sample rate (mono 16-bit)
+            obs_start = time.time()
+            obs_bytes = 0
+            try:
+                obs_interval = float(os.getenv('E2D_OBS_LOG_SEC', '2.0'))
+            except Exception:
+                obs_interval = 2.0
+            next_log = obs_start + max(0.5, obs_interval)
+            # Early check window to verify that ElevenLabs honors PCM rate; otherwise switch to buffered convert
+            # Determine requested source rate from out_fmt: "pcm_<rate>"
+            try:
+                req_rate = int(str(out_fmt).split('_')[1])
+            except Exception:
+                req_rate = int(os.getenv('ELEVEN_BLACKHOLE_RATE', '44100'))
+            expect_rate = req_rate
+            early_deadline = obs_start + float(os.getenv('E2D_EARLY_CHECK_SEC', '1.0'))
+            early_checked = False
+            for chunk in audio_stream:
+                if should_abort_playback():
+                    break
+                if not chunk:
+                    continue
+                # ensure 16-bit alignment
+                if len(chunk) & 1:
+                    chunk = chunk[:-1]
+                # accumulate stats before upmix (EL stream is mono)
+                obs_bytes += len(chunk)
+                now = time.time()
+                if now >= next_log:
+                    dur = max(1e-3, now - obs_start)
+                    inferred_rate = (obs_bytes / dur) / 2.0  # bytes/s ÷ 2 bytes/sample
+                    try:
+                        logging.info(
+                            "ElevenLabs stream observed ~%.0f bytes/s → inferred %.0f Hz (mono)",
+                            obs_bytes / dur, inferred_rate,
+                        )
+                    except Exception:
+                        pass
+                    obs_start = now
+                    obs_bytes = 0
+                    next_log = now + max(0.5, obs_interval)
+                # Early verify: if incoming isn't PCM (e.g., compressed), switch to buffered convert
+                if (not early_checked) and (now >= early_deadline):
+                    early_checked = True
+                    dur = max(1e-3, now - (early_deadline - float(os.getenv('E2D_EARLY_CHECK_SEC', '1.0'))))
+                    inf_rate = (obs_bytes / dur) / 2.0 if dur > 0 else 0
+                    if inf_rate < (0.6 * expect_rate):
+                        try:
+                            logging.info(
+                                "ElevenToDeviceStreamer: inferred %.0f Hz < %.0f; switching to buffered convert %s",
+                                inf_rate, expect_rate, out_fmt
+                            )
+                        except Exception:
+                            pass
+                        # Pull full PCM via buffered convert and feed the device buffer
+                        try:
+                            audio = eleven_client_manager.client.text_to_speech.convert(
+                                text=text,
+                                voice_id=voice_id,
+                                model_id=model_id,
+                                output_format=out_fmt,
+                                voice_settings=voice_settings,
+                            )
+                            if isinstance(audio, (bytes, bytearray)):
+                                pcm = bytes(audio)
+                                # if ElevenLabs returned mono PCM at req_rate, resample to device rate
+                                try:
+                                    rr = req_rate
+                                except Exception:
+                                    rr = expect_rate
+                                if rr and self.dev_rate and rr != self.dev_rate:
+                                    try:
+                                        a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                                        y = resample_poly(a, self.dev_rate, rr)
+                                        y = np.clip(y, -1.0, 1.0)
+                                        pcm = (y * 32767.0).astype(np.int16).tobytes()
+                                    except Exception:
+                                        pass
+                                # push in manageable chunks (output domain)
+                                step = self.frames * self.dev_channels * 2
+                                for i in range(0, len(pcm), step):
+                                    if should_abort_playback():
+                                        break
+                                    self._push(self._upmix_mono_to_stereo(pcm[i:i+step]))
+                            else:
+                                for part in audio:
+                                    if not part:
+                                        continue
+                                    if len(part) & 1:
+                                        part = part[:-1]
+                                    if should_abort_playback():
+                                        break
+                                    # resample chunk to device rate if needed
+                                    try:
+                                        rr = req_rate
+                                    except Exception:
+                                        rr = expect_rate
+                                    if rr and self.dev_rate and rr != self.dev_rate:
+                                        try:
+                                            a = np.frombuffer(part, dtype=np.int16).astype(np.float32) / 32768.0
+                                            y = resample_poly(a, self.dev_rate, rr)
+                                            y = np.clip(y, -1.0, 1.0)
+                                            part = (y * 32767.0).astype(np.int16).tobytes()
+                                        except Exception:
+                                            pass
+                                    self._push(self._upmix_mono_to_stereo(part))
+                        except Exception as ce:
+                            logging.warning(f"Buffered convert failed: {ce}")
+                        # End producer after buffered feed
+                        break
+                # ElevenLabs PCM is mono. Resample to hardware rate then upmix.
+                data = chunk
+                if req_rate and self.dev_rate and req_rate != self.dev_rate:
+                    try:
+                        import numpy as _np
+                        from scipy.signal import resample_poly as _rp
+                        a = _np.frombuffer(data, dtype=_np.int16).astype(_np.float32) / 32768.0
+                        y = _rp(a, self.dev_rate, req_rate)
+                        y = _np.clip(y, -1.0, 1.0)
+                        data = (y * 32767.0).astype(_np.int16).tobytes()
+                    except Exception:
+                        pass
+                self._push(self._upmix_mono_to_stereo(data))
+        except Exception as e:
+            logging.warning(f"ElevenToDeviceStreamer producer error: {e}")
+        finally:
+            self._done.set()
+
+    def start(self, text: str, voice_id: str, *, model_id: str, voice_settings):
+        self._probe_device()
+        # Ensure no other active streams are using the device (e.g., test tone)
+        try:
+            _DEVICE_STREAMS.stop_all()
+        except Exception:
+            pass
+        # Request rate from env (plan-supported), default 44100, else fall back to hardware rate
+        try:
+            forced_rate = int(os.getenv('ELEVEN_BLACKHOLE_RATE', '44100'))
+        except Exception:
+            forced_rate = 44100
+        if forced_rate not in (8000,16000,22050,24000,32000,44100,48000):
+            forced_rate = 44100
+        out_fmt = f"pcm_{forced_rate}"
+        try:
+            logging.info("ElevenToDeviceStreamer requesting %s from ElevenLabs (device hw_rate=%d)", out_fmt, self.dev_rate)
+        except Exception:
+            pass
+        # Start producer
+        self._producer = threading.Thread(
+            target=self._producer_main,
+            args=(text, voice_id, model_id, out_fmt, voice_settings),
+            daemon=True,
+        )
+        self._producer.start()
+
+        # Wait for prebuffer before opening device (smoother start for long clips)
+        if self.prebuffer_ms > 0:
+            target_bytes = int(self.dev_rate * self.dev_channels * 2 * (self.prebuffer_ms / 1000.0))
+            t0 = time.time()
+            while True:
+                with self._lock:
+                    have = len(self._buf)
+                if have >= target_bytes or self._done.is_set():
+                    break
+                if time.time() - t0 > 5.0:
+                    break
+                time.sleep(0.01)
+
+        # Start device stream with callback
+        self.stream = self.pa.open(
+            format=pyaudio.paInt16,
+            channels=self.dev_channels,
+            rate=self.dev_rate,
+            output=True,
+            output_device_index=self.dev_index,
+            frames_per_buffer=self.frames,
+            stream_callback=self._callback,
+        )
+        self.stream.start_stream()
+        # Register a stop callback with the registry
+        try:
+            def _stop():
+                try:
+                    if self.stream:
+                        self.stream.stop_stream(); self.stream.close()
+                except Exception:
+                    pass
+                try:
+                    if self.pa:
+                        self.pa.terminate()
+                except Exception:
+                    pass
+            _DEVICE_STREAMS.register(_stop)
+        except Exception:
+            pass
+
+    def wait(self):
+        # Wait for producer to finish and buffer to drain
+        while True:
+            if self._done.is_set():
+                with self._lock:
+                    empty = (len(self._buf) == 0)
+                if empty:
+                    break
+            if should_abort_playback():
+                break
+            time.sleep(0.01)
+        try:
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+        except Exception:
+            pass
+        try:
+            if self.pa:
+                self.pa.terminate()
+        except Exception:
+            pass
+        if self._underruns:
+            logging.info("ElevenToDeviceStreamer underruns=%d", self._underruns)
 
 # AI Interaction
 class AIInteraction:
@@ -1862,7 +2816,7 @@ class AIInteraction:
 # --------------------------------------------------------------
 class TTSEngine:
     """Abstract TTS Engine interface."""
-    def stream_text(self, text: str):
+    def stream_text(self, text: str, audio_output_override: Optional[str] = None, streaming_override: Optional[bool] = None):
         raise NotImplementedError
 
     def clone_from_file(self, file_path: str, voice_name: str):
@@ -1871,19 +2825,27 @@ class TTSEngine:
 
 class PlayHTEngine(TTSEngine):
     """Adapter over existing PlayHT code paths (VoiceCloning + AudioStreamer)."""
-    def stream_text(self, text: str):
+    def stream_text(self, text: str, audio_output_override: Optional[str] = None, streaming_override: Optional[bool] = None):
         voice_url = voice_clone_manager.get_recent_clone_url()
         if not voice_url:
-            logging.warning("PlayHTEngine.stream_text: no recent clone available; text will be skipped")
+            logging.warning("PlayHTEngine.stream_text: no recent clone available; attempting ElevenLabs fallback")
+            if AUTO_FALLBACK_TO_ELEVENLABS:
+                try:
+                    ElevenLabsEngine().stream_text(text, audio_output_override=audio_output_override, streaming_override=streaming_override)
+                    return
+                except Exception as e2:
+                    logging.error(f"ElevenLabs fallback failed: {e2}")
             return
         try:
-            if not ui_state.streaming:
+            use_streaming = ui_state.streaming if streaming_override is None else bool(streaming_override)
+            out_route = ui_state.audio_output if audio_output_override is None else str(audio_output_override)
+            if not use_streaming:
                 # Buffered path for reference-quality WAV
                 streamer = AudioStreamerBuffered()
                 streamer.stream_audio(text, voice_url)
             else:
                 # Live streaming path
-                if ui_state.audio_output == "blackhole":
+                if out_route == "blackhole":
                     # Keep BlackHole device path (uses header parser) for virtual-audio routing
                     streamer = AudioStreamerBlackHole(api_key_manager.get_current_user_id(), api_key_manager.get_current_key())
                     streamer.stream_audio(text, voice_url)
@@ -1923,7 +2885,7 @@ class PlayHTEngine(TTSEngine):
 class ElevenLabsEngine(TTSEngine):
     """Streaming-first ElevenLabs TTS with buffered fallback."""
 
-    def stream_text(self, text: str):
+    def stream_text(self, text: str, audio_output_override: Optional[str] = None, streaming_override: Optional[bool] = None):
         """
         Prefer ElevenLabs streaming (low latency), fall back to buffered convert if needed.
         Uses most-recent ElevenLabs clone if available, else ELEVENLABS_VOICE_ID.
@@ -1958,7 +2920,41 @@ class ElevenLabsEngine(TTSEngine):
             # 2) Low-latency model & compact format for streaming; override via env if desired
             els = ui_state.elevenlabs
             model_id = els.model_id_stream or os.getenv("ELEVENLABS_TTS_MODEL_STREAM", os.getenv("ELEVENLABS_TTS_MODEL", "eleven_v3"))
-            output_format = els.format_stream or os.getenv("ELEVENLABS_TTS_FORMAT_STREAM", "mp3_22050_32")
+            # Default to MP3 for non-BlackHole routes (SDK player expects MP3). BlackHole path overrides below.
+            output_format = els.format_stream or os.getenv("ELEVENLABS_TTS_FORMAT_STREAM", "mp3_44100_32")
+            # If routing to BlackHole, request raw PCM at the device's native rate to avoid resampling
+            route_blackhole = (str(audio_output_override).lower() == "blackhole") if audio_output_override is not None else (ui_state.audio_output == "blackhole")
+            bh_rate = None
+            bh_channels = 1
+            if route_blackhole:
+                pa_probe = pyaudio.PyAudio()
+                try:
+                    bh_index = None
+                    for i in range(pa_probe.get_device_count()):
+                        info = pa_probe.get_device_info_by_index(i)
+                        if 'BlackHole' in info.get('name', ''):
+                            bh_index = i
+                            bh_rate = int(info.get('defaultSampleRate') or 48000)
+                            # prefer stereo if available
+                            max_ch = int(info.get('maxOutputChannels') or 1)
+                            bh_channels = 2 if max_ch >= 2 else 1
+                            break
+                    if bh_rate is None:
+                        bh_rate = 48000
+                    # choose matching ElevenLabs PCM format
+                    if bh_rate not in (8000, 16000, 22050, 24000, 44100, 48000):
+                        bh_rate = 48000
+                    output_format = f"pcm_{bh_rate}"
+                finally:
+                    pa_probe.terminate()
+                # Visibility: confirm what device rate/channels and format we will stream
+                try:
+                    logging.info(
+                        "ElevenLabs BlackHole route: device_rate=%d Hz, channels=%d, output_format=%s",
+                        bh_rate, bh_channels, output_format
+                    )
+                except Exception:
+                    pass
 
             settings = {
                 "use_speaker_boost": bool(els.use_speaker_boost),
@@ -1971,6 +2967,48 @@ class ElevenLabsEngine(TTSEngine):
 
             # 4) STREAMING PATH
             try:
+                # Use HTTP-based robust streamer for BlackHole (handles unexpected MP3)
+                if route_blackhole:
+                    device_hint = 'BlackHole'
+                    try:
+                        ao = (audio_output_override if audio_output_override is not None else ui_state.audio_output) or ''
+                        if 'vb' in ao.lower():
+                            device_hint = 'VB-Cable'
+                    except Exception:
+                        pass
+                    try:
+                        forced_rate = int(os.getenv('ELEVEN_BLACKHOLE_RATE', '44100'))
+                    except Exception:
+                        forced_rate = 44100
+                    if forced_rate not in (8000,16000,22050,24000,32000,44100,48000):
+                        forced_rate = 44100
+                    frames = int(os.getenv('PYAUDIO_FRAMES', str(CHUNK)))
+                    # Publish route for GUI
+                    try:
+                        with ui_state.lock:
+                            ui_state.audio_route = {
+                                "device": device_hint,
+                                "requested_rate": forced_rate,
+                                "device_rate": forced_rate,
+                                "device_channels": 2,
+                                "frames": frames,
+                                "prebuffer_ms": int(os.getenv('E2D_PREBUFFER_MS', '3000')),
+                            }
+                    except Exception:
+                        pass
+                    # Do the HTTP stream
+                    stream_eleven_http_to_blackhole(
+                        voice_id=voice_id,
+                        text=text,
+                        model_id=model_id,
+                        device_hint=device_hint,
+                        device_rate=forced_rate,
+                        frames_per_buffer=frames,
+                        jitter_ms=int(os.getenv('E2D_JITTER_MS', '150')),
+                        requested_of=f"pcm_{forced_rate}",
+                    )
+                    ADMIN_ABORT_TTS.clear()
+                    return
                 eleven_client_manager.ensure_fresh()
                 audio_stream = eleven_client_manager.client.text_to_speech.stream(
                     text=text,
@@ -1979,28 +3017,177 @@ class ElevenLabsEngine(TTSEngine):
                     output_format=output_format,
                     voice_settings=voice_settings,
                 )
+                # ElevenLabs PCM stream is mono 16-bit LE. When routing to stereo devices
+                # (e.g., BlackHole 2ch → Ableton), upmix to interleaved stereo or open the
+                # output stream as 1 channel. Mismatched channel counts cause pops/warping.
+                if route_blackhole and output_format.startswith("pcm_"):
+                    import array
+                    pa = pyaudio.PyAudio()
 
-                # 4a) If the SDK's local streamer is available, use it (lowest effort)
-                if el_stream and callable(el_stream):
+                    def _probe_blackhole():
+                        bh_index = None
+                        bh_rate = 48000
+                        bh_channels = 2
+                        for i in range(pa.get_device_count()):
+                            info = pa.get_device_info_by_index(i)
+                            if 'BlackHole' in str(info.get('name', '')):
+                                bh_index = i
+                                try:
+                                    r = int(info.get('defaultSampleRate') or 48000)
+                                    if r in (8000, 16000, 22050, 24000, 32000, 44100, 48000):
+                                        bh_rate = r
+                                except Exception:
+                                    pass
+                                try:
+                                    max_ch = int(info.get('maxOutputChannels') or 2)
+                                    bh_channels = 2 if max_ch >= 2 else 1
+                                except Exception:
+                                    pass
+                                break
+                        if bh_index is None:
+                            raise RuntimeError("BlackHole output device not found")
+                        return bh_index, bh_rate, bh_channels
+
+                    def _mono16_to_stereo(pcm: bytes) -> bytes:
+                        if not pcm:
+                            return pcm
+                        if len(pcm) & 1:
+                            pcm = pcm[:-1]
+                        a = array.array('h'); a.frombytes(pcm)
+                        out = array.array('h', [0]) * (len(a) * 2)
+                        j = 0
+                        for s in a:
+                            out[j] = s; out[j+1] = s; j += 2
+                        return out.tobytes()
+
+                    bh_index, bh_rate, bh_channels = _probe_blackhole()
+
+                    desired_fmt = f"pcm_{bh_rate}"
+                    if output_format != desired_fmt:
+                        try:
+                            audio_stream.close()
+                        except Exception:
+                            pass
+                        audio_stream = eleven_client_manager.client.text_to_speech.stream(
+                            text=text,
+                            voice_id=voice_id,
+                            model_id=model_id,
+                            output_format=desired_fmt,
+                            voice_settings=voice_settings,
+                        )
+
+                    if BLACKHOLE_WRITE_TO_FILE:
+                        ts = time.strftime("%Y%m%d-%H%M%S")
+                        out_path = f"RecordedAudio/blackhole_debug_eleven_stream_{ts}.wav"
+                        try:
+                            wf = wave.open(out_path, 'wb')
+                            wf.setnchannels(bh_channels)
+                            wf.setsampwidth(2)
+                            wf.setframerate(bh_rate)
+                            for chunk in audio_stream:
+                                if not chunk:
+                                    continue
+                                if should_abort_playback():
+                                    logging.info("Abort requested – stopping ElevenLabs BlackHole stream (file)")
+                                    break
+                                if len(chunk) & 1:
+                                    chunk = chunk[:-1]
+                                if bh_channels == 2:
+                                    chunk = _mono16_to_stereo(chunk)
+                                wf.writeframes(chunk)
+                        finally:
+                            try:
+                                wf.close()
+                                logging.info(f"Wrote ElevenLabs BlackHole debug WAV to {out_path}")
+                            except Exception:
+                                pass
+                        ADMIN_ABORT_TTS.clear()
+                        return
+                    else:
+                        stream = pa.open(
+                            format=pyaudio.paInt16,
+                            channels=bh_channels,
+                            rate=bh_rate,
+                            output=True,
+                            output_device_index=bh_index,
+                            frames_per_buffer=CHUNK,
+                        )
+
+                        try:
+                            for chunk in audio_stream:
+                                if not chunk:
+                                    continue
+                                if should_abort_playback():
+                                    logging.info("Abort requested – stopping ElevenLabs BlackHole stream")
+                                    break
+                                if len(chunk) & 1:
+                                    chunk = chunk[:-1]
+                                if bh_channels == 2:
+                                    chunk = _mono16_to_stereo(chunk)
+                                stream.write(chunk)
+                        finally:
+                            try:
+                                stream.stop_stream(); stream.close()
+                            except Exception:
+                                pass
+                            pa.terminate()
+                            ADMIN_ABORT_TTS.clear()
+                        return
+
+                # Non-BlackHole: if the SDK's local streamer is available, use it for MP3 only
+                if el_stream and callable(el_stream) and ("mp3" in (output_format or "")):
                     el_stream(audio_stream)
                     return
 
-                # 4b) Fallback: write streamed chunks to a temp file progressively, then play
-                import tempfile
-                suffix = ".mp3" if "mp3" in output_format else ".wav"
-                with tempfile.NamedTemporaryFile(prefix="11l_stream_", suffix=suffix, delete=False) as tf:
-                    for chunk in audio_stream:
-                        if chunk:
-                            tf.write(chunk)
-                    tmp_path = tf.name
-                _play_file_best_effort(tmp_path, codec_hint=("mp3" if suffix==".mp3" else "wav"))
+                # Fallback: write streamed chunks to a temp file then play
+                import tempfile, wave
+                if str(output_format or '').startswith('pcm_'):
+                    # Wrap raw PCM to a valid WAV container for system playback
+                    try:
+                        sr = int(str(output_format).split('_')[1])
+                    except Exception:
+                        sr = 44100
+                    with tempfile.NamedTemporaryFile(prefix="11l_stream_", suffix=".wav", delete=False) as tf:
+                        tmp_path = tf.name
+                    with contextlib.closing(wave.open(tmp_path, 'wb')) as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sr)
+                        for chunk in audio_stream:
+                            if not chunk:
+                                continue
+                            if len(chunk) & 1:
+                                chunk = chunk[:-1]
+                            wf.writeframes(chunk)
+                    _play_file_best_effort(tmp_path, codec_hint='wav')
+                else:
+                    suffix = ".mp3" if "mp3" in (output_format or '') else ".bin"
+                    with tempfile.NamedTemporaryFile(prefix="11l_stream_", suffix=suffix, delete=False) as tf:
+                        for chunk in audio_stream:
+                            if chunk:
+                                tf.write(chunk)
+                        tmp_path = tf.name
+                    _play_file_best_effort(tmp_path, codec_hint=('mp3' if suffix=='.mp3' else 'bin'))
                 return
             except Exception as se:
                 logging.warning(f"ElevenLabsEngine.stream_text: streaming failed ({se}); falling back to buffered convert")
 
             # 5) BUFFERED FALLBACK (previous behaviour)
             model_id_fb = els.model_id_buffered or "eleven_v3"
-            output_format_fb = els.format_buffered or "mp3_44100_128"
+            output_format_fb = els.format_buffered or "pcm_44100"
+            if route_blackhole:
+                # Match device default rate if possible
+                rate_fb = bh_rate or 48000
+                if rate_fb not in (8000,16000,22050,24000,44100,48000):
+                    rate_fb = 48000
+                output_format_fb = f"pcm_{rate_fb}"
+                try:
+                    logging.info(
+                        "ElevenLabs BlackHole buffered: device_rate=%d Hz, channels=%d, output_format=%s",
+                        rate_fb, bh_channels, output_format_fb
+                    )
+                except Exception:
+                    pass
             eleven_client_manager.ensure_fresh()
             audio = eleven_client_manager.client.text_to_speech.convert(
                 text=text,
@@ -2020,25 +3207,120 @@ class ElevenLabsEngine(TTSEngine):
                         buf_bytes.extend(chunk)
                 buf = bytes(buf_bytes)
 
-            # Try SDK play helper; if absent, use system fallback
-            try:
-                if el_play is not None:
-                    if callable(el_play):
-                        el_play(buf)
+            # Try SDK play helper (non-BlackHole). If BlackHole, play via PyAudio.
+            if route_blackhole and output_format_fb.startswith("pcm_"):
+                # Buffered PCM → either write to WAV (debug) or play via BlackHole
+                try:
+                    if BLACKHOLE_WRITE_TO_FILE:
+                        ts = time.strftime("%Y%m%d-%H%M%S")
+                        out_path = f"RecordedAudio/blackhole_debug_eleven_buffered_{ts}.wav"
+                        try:
+                            sample_rate = int(output_format_fb.split('_')[1])
+                        except Exception:
+                            sample_rate = bh_rate or 48000
+                        channels = 2 if (bh_channels or 1) >= 2 else 1
+                        try:
+                            wf = wave.open(out_path, 'wb')
+                            wf.setnchannels(channels)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sample_rate)
+                            pcm = buf
+                            if len(pcm) & 1:
+                                pcm = pcm[:-1]
+                            if channels == 2:
+                                out = bytearray(len(pcm)*2)
+                                mv = memoryview(out)
+                                mv[0::4] = pcm[0::2]
+                                mv[1::4] = pcm[1::2]
+                                mv[2::4] = pcm[0::2]
+                                mv[3::4] = pcm[1::2]
+                                pcm = bytes(out)
+                            wf.writeframes(pcm)
+                        finally:
+                            try:
+                                wf.close()
+                                logging.info(f"Wrote ElevenLabs BlackHole debug WAV to {out_path}")
+                            except Exception:
+                                pass
                         return
-                    maybe_fn = getattr(el_play, 'play', None)
-                    if callable(maybe_fn):
-                        maybe_fn(buf)
+                    else:
+                        pa = pyaudio.PyAudio()
+                        bh_index = None
+                        bh_info = None
+                        for i in range(pa.get_device_count()):
+                            dev = pa.get_device_info_by_index(i)
+                            if 'BlackHole' in dev.get('name', ''):
+                                bh_index = i
+                                bh_info = dev
+                                break
+                        if bh_index is None:
+                            logging.error("ElevenLabsEngine: BlackHole device not found; falling back to system player")
+                            raise RuntimeError("no_blackhole")
+                        try:
+                            sample_rate = int(output_format_fb.split('_')[1])
+                        except Exception:
+                            sample_rate = bh_rate or 48000
+                        channels = 2 if int(bh_info.get('maxOutputChannels') or 1) >= 2 else 1
+                        frames = int(os.getenv('PYAUDIO_FRAMES', str(CHUNK)))
+                        stream = pa.open(format=pyaudio.paInt16, channels=channels, rate=sample_rate, output=True,
+                                         output_device_index=bh_index, frames_per_buffer=frames)
+                        try:
+                            pcm = buf
+                            if len(pcm) & 1:
+                                pcm = pcm[:-1]
+                            if channels == 2:
+                                # duplicate mono to stereo
+                                out = bytearray(len(pcm)*2)
+                                mv = memoryview(out)
+                                mv[0::4] = pcm[0::2]
+                                mv[1::4] = pcm[1::2]
+                                mv[2::4] = pcm[0::2]
+                                mv[3::4] = pcm[1::2]
+                                pcm = bytes(out)
+                            stream.write(pcm)
+                        finally:
+                            try:
+                                stream.stop_stream(); stream.close()
+                            except Exception:
+                                pass
+                            pa.terminate()
                         return
-                raise TypeError("elevenlabs.play helper unavailable or not callable")
-            except Exception as e:
-                logging.warning(f"ElevenLabsEngine.stream_text: elevenlabs.play fallback failed ({e}); using system player")
-                import tempfile
-                suffix = ".mp3" if "mp3" in output_format_fb else ".wav"
-                with tempfile.NamedTemporaryFile(prefix='11l_tts_', suffix=suffix, delete=False) as tf:
-                    tf.write(buf)
-                    tmp_path = tf.name
-                _play_file_best_effort(tmp_path, codec_hint=("mp3" if suffix==".mp3" else "wav"))
+                except Exception:
+                    # fall back to system player below
+                    pass
+            else:
+                try:
+                    if el_play is not None:
+                        if callable(el_play):
+                            el_play(buf)
+                            return
+                        maybe_fn = getattr(el_play, 'play', None)
+                        if callable(maybe_fn):
+                            maybe_fn(buf)
+                            return
+                    raise TypeError("elevenlabs.play helper unavailable or not callable")
+                except Exception as e:
+                    logging.warning(f"ElevenLabsEngine.stream_text: elevenlabs.play fallback failed ({e}); using system player")
+                    import tempfile, wave
+                    if str(output_format_fb or '').startswith('pcm_'):
+                        try:
+                            sr = int(str(output_format_fb).split('_')[1])
+                        except Exception:
+                            sr = 44100
+                        with tempfile.NamedTemporaryFile(prefix='11l_tts_', suffix='.wav', delete=False) as tf:
+                            tmp_path = tf.name
+                        with contextlib.closing(wave.open(tmp_path, 'wb')) as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sr)
+                            wf.writeframes(buf if not (len(buf) & 1) else buf[:-1])
+                        _play_file_best_effort(tmp_path, codec_hint='wav')
+                    else:
+                        suffix = '.mp3' if 'mp3' in (output_format_fb or '') else '.bin'
+                        with tempfile.NamedTemporaryFile(prefix='11l_tts_', suffix=suffix, delete=False) as tf:
+                            tf.write(buf)
+                            tmp_path = tf.name
+                        _play_file_best_effort(tmp_path, codec_hint=('mp3' if suffix=='.mp3' else 'bin'))
 
         except Exception as e:
             logging.error(f"ElevenLabsEngine.stream_text failed: {e}")
@@ -2076,10 +3358,18 @@ def get_tts_engine() -> TTSEngine:
     logging.info("TTS engine: PlayHT (live)")
     return PlayHTEngine()
 
-def tts_speak(text: str):
+def tts_speak(text: str, *, audio_output_override: Optional[str] = None, streaming_override: Optional[bool] = None, engine_override: Optional[str] = None):
     try:
-        engine = get_tts_engine()
-        engine.stream_text(text)
+        engine: TTSEngine
+        if engine_override:
+            eo = engine_override.strip().lower()
+            if eo == 'elevenlabs':
+                engine = ElevenLabsEngine()
+            else:
+                engine = PlayHTEngine()
+        else:
+            engine = get_tts_engine()
+        engine.stream_text(text, audio_output_override=audio_output_override, streaming_override=streaming_override)
     except Exception as e:
         logging.error(f"tts_speak failed: {e}")
 
@@ -2749,6 +4039,62 @@ def fetch_elevenlabs_voices_with_key(api_key: str):
         logging.error(f"Failed to fetch ElevenLabs voices (alias-specific): {e}")
         return None
 
+
+# ---------------- ElevenLabs voice resolution helper ----------------
+from typing import Optional
+
+def resolve_active_eleven_voice_id(preferred: Optional[str] = None) -> Optional[str]:
+    """Return a voice_id that exists for the CURRENT ElevenLabs API key.
+    Order of precedence:
+      1) If `preferred` is provided and exists (via /voices/{id}), return it.
+      2) Else list voices for the current key (cloned/generated only) and return the newest.
+      3) Else fall back to local cache filtered by active alias.
+    """
+    try:
+        api_key = eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            return None
+
+        # 1) Honor preferred if it truly exists for the current key
+        if preferred:
+            try:
+                if eleven_voice_exists(preferred):
+                    return preferred
+            except Exception:
+                pass
+
+        # 2) Ask ElevenLabs which voices this key can actually see
+        voices = fetch_elevenlabs_voices() or []
+        if voices:
+            try:
+                voices.sort(key=lambda v: v.get("created_at") or 0)
+            except Exception:
+                pass
+            # newest matching entry (prefer cloned/generated already filtered by fetch_...)
+            if voices:
+                return voices[-1].get("id")
+
+        # 3) Fallback: local cache filtered by account alias
+        try:
+            data = ElevenKeyring.load()
+            active = ElevenKeyring.get_active_record(data)
+            alias = active.get("alias") if active else (data.get("last_active_alias") if data.get("keys") else None)
+        except Exception:
+            alias = None
+        try:
+            candidates = [
+                c for c in list(voice_clone_manager.clones)
+                if c.get("engine") == "elevenlabs" and (alias is None or c.get("account_alias") == alias)
+            ]
+            candidates.sort(key=lambda c: c.get("created_at") or 0)
+            if candidates:
+                return candidates[-1].get("id")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
 def eleven_voice_exists(voice_id: str) -> bool:
     """Return True if the current ElevenLabs key can see `voice_id`."""
     if not voice_id:
@@ -2975,7 +4321,7 @@ class PlayHTVoiceSynthesizer:
                 with open('output.mp3', 'ab') as f:
                     f.write(chunk)
         except Exception as e:
-            print(f"error in gen and strean: {e}")
+            logging.info(f"error in gen and strean: {e}")
                     
     def generate_from_text(self, GPTtext, rate = RATE, style = 30):
         url = "https://api.play.ht/api/v2/tts"
@@ -3158,7 +4504,7 @@ def ring_cycle():
 
 def music_cycle():
 
-    print("music")
+    logging.info("music")
 
     try:
         set = live.Set(scan=True)
@@ -3172,90 +4518,161 @@ def music_cycle():
     tempo = 60.0
     set.tempo = tempo
     track = set.tracks[0]
-    print("Track name '%s'" % track.name)
+    logging.info("Track name '%s'" % track.name)
     clip = track.clips[1]
-    print("Clip name '%s', length %d beats" % (clip.name, clip.length))
+    logging.info("Clip name '%s', length %d beats" % (clip.name, clip.length))
     clip.play()
 
     clip_length_beats = clip.length
     clip_length_seconds = (clip_length_beats / tempo) * 60  # Convert beats to seconds
-    print("Clip length in seconds: %f" % clip_length_seconds)
+    logging.info("Clip length in seconds: %f" % clip_length_seconds)
 
-    timerDown = clip_length_seconds
+    # Wait while on-hook; abort immediately once off-hook
     try:
-        while arduino.onHold() and timerDown > 1:
-            timerDown -= 2.1
-            time.sleep(2)
-            if timerDown < 150 and timerDown > 149:
-                arduino.double_ring()
+        if arduino._wait_until_offhook(clip_length_seconds, clip_to_stop=clip):
+            return
     except Exception as e:
-        print(e)
+        logging.info(e)
     finally:
-        clip.stop()
-        arduino.double_ring()
+        try:
+            clip.stop()
+        except Exception:
+            pass
+        try:
+            arduino.double_ring()
+        except Exception:
+            pass
 
-    print("Clip has finished playing.")
+    logging.info("Clip has finished playing.")
 
 def poem_cycle():
 
-    print("poem")
+    logging.info("poem")
     
     set = live.Set(scan=True)
     tempo = 60.0
     set.tempo = tempo
     track = set.tracks[0]
-    print("Track name '%s'" % track.name)
+    logging.info("Track name '%s'" % track.name)
     clip = track.clips[1]
-    print("Clip name '%s', length %d beats" % (clip.name, clip.length))
+    logging.info("Clip name '%s', length %d beats" % (clip.name, clip.length))
     clip.play()
 
     start_time = time.time()
 
-    time.sleep(25)
+    # Wait while on-hook, but abort immediately if handset lifted
+    try:
+        if arduino._wait_until_offhook(25, clip_to_stop=clip):
+            return
+    except Exception:
+        time.sleep(25)
 
     try:
-        streamer = AudioStreamerBlackHole(api_key_manager.get_current_user_id(),api_key_manager.get_current_key())
+        # Guard thread to abort TTS if handset is lifted mid-stream
+        def _abort_guard():
+            while True:
+                try:
+                    if not arduino.onHold():
+                        ADMIN_ABORT_TTS.set()
+                        break
+                except Exception:
+                    break
+                time.sleep(0.1)
 
-        streamer.stream_audio(poem[5],voice_clone_manager.get_recent_clone_url())
-        streamer.stream_audio(poem[6],voice_clone_manager.get_recent_clone_url())
+        guard = threading.Thread(target=_abort_guard, daemon=True)
+        guard.start()
+
+        # Fake realtime: render each stanza to file and play with small delay
+        try:
+            forced_rate = int(os.getenv('ELEVEN_BLACKHOLE_RATE', '44100'))
+        except Exception:
+            forced_rate = 44100
+        try:
+            buffer_files = int(os.getenv('FAKE_STREAM_BUFFER_FILES', '2'))
+        except Exception:
+            buffer_files = 2
+        lines = [poem[5], poem[6]]
+        logging.info("Poem fake-stream: %d lines @ %d Hz, buffer_files=%d", len(lines), forced_rate, buffer_files)
+        fs = ElevenFakeStreamer(device_hint='BlackHole', rate=forced_rate, buffer_files=buffer_files)
+        fs.start(lines)
+        # Do not block here; playback runs while the clip plays and until off-hook
+        ADMIN_ABORT_TTS.clear()
     except Exception as e:
-        print(e)
+        logging.info(e)
 
     clip_length_beats = clip.length
     clip_length_seconds = (clip_length_beats / tempo) * 60  # Convert beats to seconds
-    print("Clip length in seconds: %f" % clip_length_seconds)
+    logging.info("Clip length in seconds: %f" % clip_length_seconds)
 
     elapsed_time = time.time() - start_time
     remaining_time = clip_length_seconds - elapsed_time
     if remaining_time > 0:
-        time.sleep(remaining_time)
+        if arduino._wait_until_offhook(remaining_time, clip_to_stop=clip):
+            return
 
-    print("Clip has finished playing.")
+    logging.info("Clip has finished playing.")
 
-def word_cycle():
+def word_cycle(num_random: int = 3, inter_line_pause: float = 0.2):
+    """Speak the first line, a few random middle lines, then the last line.
+    Uses ElevenLabs HTTP streamer via streamToSpeakers().
+    """
     print("word")
     try:
-        streamer = AudioStreamerBlackHole(api_key_manager.get_current_user_id(),api_key_manager.get_current_key())
-        # How many random middle sections you want:
-        num_random = 3
+        # Validate poem
+        if not isinstance(poem, (list, tuple)) or not poem:
+            logging.warning("word_cycle: 'poem' is empty or invalid")
+            return
 
-        # All valid “middle” indices are 1 .. len(poem)-2
-        middle_range = range(1, len(poem) - 1)
-        random_middle = random.sample(middle_range, k=num_random)
+        n = len(poem)
+        # Choose up to num_random unique middle indices (1..n-2)
+        middle_indices = list(range(1, n - 1)) if n > 2 else []
+        k = max(0, min(num_random, len(middle_indices)))
+        random_middle = random.sample(middle_indices, k=k) if k else []
+        # Order: first, random middles (random order), last (if exists)
+        indices = ([0] if n >= 1 else []) + random_middle + ([n - 1] if n >= 2 else [])
 
-        # Build the full list: first, the random middles, then last
-        indices = [0] + random_middle + [len(poem) - 1]
+        # Resolve credentials/voice once (keychain + alias-aware voice resolution)
+        api_key = (eleven_client_manager.current_api_key() or os.getenv("ELEVENLABS_API_KEY"))
+        preferred = voice_clone_manager.get_recent_clone_id(engine='elevenlabs') or os.getenv('ELEVENLABS_VOICE_ID')
+        voice_id = resolve_active_eleven_voice_id(preferred)
+        if not api_key or not voice_id:
+            logging.error("word_cycle: missing or invalid ElevenLabs api_key/voice_id (has_key=%s, preferred=%s, resolved=%s)", bool(api_key), preferred, voice_id)
+            return
+        else:
+            if preferred and preferred != voice_id:
+                logging.info("word_cycle: preferred voice %s not visible to active key; using %s", preferred, voice_id)
+            else:
+                logging.info("word_cycle: using ElevenLabs voice %s", voice_id)
 
-        for i in indices:
-            streamer.stream_audio(
-                poem[i],
-                voice_clone_manager.get_recent_clone_url(),
-            )
+        for idx in indices:
+            if should_abort_playback():
+                logging.info("word_cycle: aborted before line %s", idx)
+                break
+            try:
+                text = str(poem[idx]).strip()
+            except Exception:
+                text = ""
+            if not text:
+                continue
+
+            try:
+                ok = streamToSpeakers(api_key=api_key, voice_id=voice_id, text=text)
+            except Exception as e:
+                logging.warning("word_cycle: streamToSpeakers raised on line %s: %s", idx, e)
+                ok = False
+
+            if not ok:
+                logging.warning("word_cycle: streamToSpeakers failed for line %s", idx)
+
+            if inter_line_pause > 0:
+                try:
+                    time.sleep(inter_line_pause)
+                except Exception:
+                    pass
     except Exception as e:
-        print(e)
+        logging.exception(e)
 
     print("Clip has finished playing.")
-
 
 def test_full_interaction_cycle():
 
@@ -3307,7 +4724,7 @@ def test_full_interaction_cycle():
     
 
     except Exception as e:
-        print(e)
+        logging.info(e)
 
     arduino.led_Off()
     arduino.led_speaking()
@@ -3324,7 +4741,7 @@ def test_full_interaction_cycle():
         
             # Step 1: Record audio with voice activity detection
             arduino.led_recording()
-            print("Recording... Speak into the microphone.")
+            logging.info("Recording... Speak into the microphone.")
             recorder = AudioRecorderWithVAD()
             audio_path = recorder.record_with_vad(
                 initial_silence_timeout=ui_state.vad.initial_silence_timeout,
@@ -3345,13 +4762,13 @@ def test_full_interaction_cycle():
             else:
                 session_manager.add_clip(audio_path)
                 arduino.led_set_off()
-                print(f"Recording complete. Audio saved to {audio_path}")
+                logging.info(f"Recording complete. Audio saved to {audio_path}")
 
             #Check if the voice cloning ai has enough data   
 
             if session_manager.should_send_for_cloning():
                 arduino.led_cloning()
-                print("got plenty sending for cloning")
+                logging.info("got plenty sending for cloning")
                 session.add_system_message(GPTinstructionsCloned[j])
                 if j < (len(GPTinstructionsCloned)-1):
                     j += 1
@@ -3367,9 +4784,9 @@ def test_full_interaction_cycle():
 
             #transcription = openai_handler.transcribe_audio(audio_path=audio_path)
             ui_state.append_message("user", transcription or "")
-            print('you said ', transcription)
+            logging.info('you said %s', transcription)
             if 'exit' in transcription.lower():
-                print("exiting program")
+                logging.info("exiting program")
                 loop = False
                 word_cycle()
                 poem_cycle()
@@ -3381,7 +4798,7 @@ def test_full_interaction_cycle():
             session.add_user_message(transcription)
             log.write_text(f"user: {transcription}")
             response = session.get_response()
-            print("AI says:", response)
+            logging.info("AI says: %s", response)
             log.write_text(f"assistant: {response}")
             ui_state.append_message("assistant", response or "")
 
@@ -3399,12 +4816,17 @@ def test_full_interaction_cycle():
                 break
 
     except Exception as e:
-        print(e)
+        logging.info(e)
         
     finally:
         # Clear director end flag for next run
         ADMIN_END_CONVERSATION.clear()
+        # Always run post-conversation cycles
         word_cycle()
+        try:
+            poem_cycle()
+        except Exception as _e:
+            logging.warning(f"poem_cycle failed: {_e}")
         dataLog.clear_file()
         arduino.led_set_off()
         arduino.led_Off()
@@ -3415,7 +4837,7 @@ def test_full_interaction_cycle():
                 ui_state.append_message("assistant", response or "")
                 dataLog.write_text(response)
             except errorCatching as e:
-                print(e)
+                logging.info(e)
             music_cycle()
         j = 0
 
@@ -3632,6 +5054,138 @@ def start_control_server(host: str = "127.0.0.1", port: int = 8765):
         if "audio_output" in payload: ui_state.set_audio_output(payload["audio_output"])
         if "streaming" in payload: ui_state.set_streaming(payload["streaming"])
         return {"ok": True, "audio_output": ui_state.audio_output, "streaming": ui_state.streaming}
+
+    @app.post("/audio/test_tone")
+    def audio_test_tone(payload: dict):
+        """
+        Generate a continuous sine tone to the BlackHole device to verify end-to-end routing.
+        Payload: {"seconds": int, "freq": float, "rate": int, "device": str}
+        Defaults: seconds=5, freq=1000.0 Hz, rate=44100, device contains "BlackHole".
+        """
+        seconds = int(payload.get("seconds", 5) or 5)
+        freq = float(payload.get("freq", 1000.0) or 1000.0)
+        try:
+            rate = int(payload.get("rate", int(os.getenv('TEST_TONE_RATE', '44100'))))
+        except Exception:
+            rate = 44100
+        dev_sub = str(payload.get("device", "BlackHole") or "BlackHole")
+        frames = int(os.getenv('PYAUDIO_FRAMES', str(CHUNK)))
+        mode = str(payload.get("mode", "blocking") or "blocking").strip().lower()
+
+        try:
+            pa = pyaudio.PyAudio()
+            idx = None
+            info_m = None
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                if dev_sub.lower() in str(info.get('name','')).lower():
+                    idx = i
+                    info_m = info
+                    break
+            if idx is None:
+                raise RuntimeError(f"Output device containing '{dev_sub}' not found")
+            channels = 2 if int(info_m.get('maxOutputChannels') or 1) >= 2 else 1
+
+            if mode == "callback":
+                # Legacy callback mode (can be CPU-sensitive in Python)
+                import math
+                phase = 0.0
+                two_pi = 2.0 * math.pi
+                phase_inc = two_pi * freq / rate
+                def cb(in_data, frame_count, time_info, status):
+                    nonlocal phase
+                    n = frame_count
+                    buf = bytearray(n * 2)
+                    for i in range(n):
+                        s = int(32767 * (0.2 * math.sin(phase)))
+                        buf[2*i] = s & 0xff
+                        buf[2*i+1] = (s >> 8) & 0xff
+                        phase += phase_inc
+                        if phase >= two_pi:
+                            phase -= two_pi
+                    pcm = bytes(buf)
+                    if channels == 2:
+                        out = bytearray(len(pcm) * 2)
+                        mv = memoryview(out)
+                        mv[0::4] = pcm[0::2]
+                        mv[1::4] = pcm[1::2]
+                        mv[2::4] = pcm[0::2]
+                        mv[3::4] = pcm[1::2]
+                        pcm = bytes(out)
+                    return (pcm, pyaudio.paContinue)
+                stream = pa.open(format=pyaudio.paInt16, channels=channels, rate=rate, output=True,
+                                 output_device_index=idx, frames_per_buffer=frames, stream_callback=cb)
+                stream.start_stream()
+                t0 = time.time()
+                while stream.is_active() and (time.time() - t0 < seconds):
+                    time.sleep(0.05)
+                try:
+                    stream.stop_stream(); stream.close()
+                except Exception:
+                    pass
+            else:
+                # Blocking write mode with vectorized generation (more stable)
+                import numpy as np
+                t = np.arange(0, seconds, 1.0/rate, dtype=np.float32)
+                mono = (0.2 * np.sin(2*np.pi*freq*t)).astype(np.float32)
+                pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+                if channels == 2:
+                    out = bytearray(len(pcm) * 2)
+                    mv = memoryview(out)
+                    mv[0::4] = pcm[0::2]
+                    mv[1::4] = pcm[1::2]
+                    mv[2::4] = pcm[0::2]
+                    mv[3::4] = pcm[1::2]
+                    pcm = bytes(out)
+                stream = pa.open(format=pyaudio.paInt16, channels=channels, rate=rate, output=True,
+                                 output_device_index=idx, frames_per_buffer=frames)
+                # Write in large chunks (e.g., 0.5s) to reduce scheduling overhead
+                chunk_bytes = int(rate * channels * 2 * 0.5)
+                for i in range(0, len(pcm), chunk_bytes):
+                    if should_abort_playback():
+                        break
+                    stream.write(pcm[i:i+chunk_bytes])
+                try:
+                    stream.stop_stream(); stream.close()
+                except Exception:
+                    pass
+            pa.terminate()
+            return {"ok": True, "seconds": seconds, "freq": freq, "rate": rate, "device": info_m.get('name','?'), "channels": channels, "mode": mode}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    @app.post("/eleven/fake_stream")
+    def eleven_fake_stream(payload: dict):
+        """
+        Fake realtime: request ElevenLabs TTS for each line, save as WAV, and
+        play them in order with a small initial file delay.
+
+        Payload: {
+          "lines": [str, ...],
+          "device": "BlackHole"|"VB-CABLE"|...,   # substring match, default BlackHole
+          "rate": 44100,                            # ElevenLabs PCM rate
+          "buffer_files": 2,                        # initial delay in files
+        }
+        """
+        lines = payload.get("lines") or []
+        if not isinstance(lines, list) or not lines:
+            return {"ok": False, "error": "lines must be a non-empty list"}
+        dev = str(payload.get("device", "BlackHole") or "BlackHole")
+        try:
+            rate = int(payload.get("rate", int(os.getenv('ELEVEN_BLACKHOLE_RATE', '44100'))))
+        except Exception:
+            rate = 44100
+        try:
+            buf_files = int(payload.get("buffer_files", 2))
+        except Exception:
+            buf_files = 2
+        try:
+            streamer = ElevenFakeStreamer(device_hint=dev, rate=rate, buffer_files=buf_files)
+            streamer.start(lines)
+            # Non-blocking endpoint: return immediately
+            return {"ok": True, "device": dev, "rate": rate, "buffer_files": buf_files}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     @app.post("/speak")
     def speak(payload: dict):
@@ -3972,7 +5526,7 @@ We ignore the decay, our basket of eggs turned to dust.
             
 
 if __name__ == "__main__":
-    # Optional: disable control server for faster/lighter startup
+    # Optional: disable control server for faster/lighter startupßß
     if not _env_bool("DISABLE_CONTROL_SERVER", False):
         start_control_server()
     # Optionally seed a voice clone from the most recent consolidated audio
@@ -3988,8 +5542,8 @@ if __name__ == "__main__":
 
         try:
             while(True):
-    
-
+                #word_cycle()
+                #poem_cycle()
                 test_full_interaction_cycle()
 
         except Exception as e:
